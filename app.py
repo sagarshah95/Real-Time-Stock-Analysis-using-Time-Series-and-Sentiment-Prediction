@@ -87,14 +87,6 @@ def make_pred(df, periods):
 
 
 def main():
-    def install_requirements():
-    """Install dependencies from requirements.txt."""
-    try:
-        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt'])
-        print("Dependencies installed successfully.")
-    except subprocess.CalledProcessError as e:
-        print(f"Failed to install dependencies: {e}")
-        sys.exit(1)
 
     
     df = load_data()
