@@ -16,7 +16,8 @@ urllib3==1.26.4
 bs4==0.0.1
 beautifulsoup4==4.9.3
 vaderSentiment==3.3.2
-
+gensim==4.0.1
+gensim-sum-ext==0.1.2
 altair==4.1.0
 appdirs==1.4.3
 argon2-cffi==20.1.0
