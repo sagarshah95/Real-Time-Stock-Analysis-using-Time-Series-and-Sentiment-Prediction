@@ -324,7 +324,7 @@ def main():
             df['macd'] = df['ema12'] - df['ema26']
             df['signal'] = df['macd'].ewm(span=9, min_periods=9).mean()
             df.dropna(inplace=True)
-            return df`
+            return df
 
         st.title('Company Stocks Advanced Details')
         st.subheader('Moving Average')
