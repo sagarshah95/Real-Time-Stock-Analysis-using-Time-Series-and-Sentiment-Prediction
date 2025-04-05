@@ -324,17 +324,7 @@ def main():
             df['macd'] = df['ema12'] - df['ema26']
             df['signal'] = df['macd'].ewm(span=9, min_periods=9).mean()
             df.dropna(inplace=True)
-            return df
-
-        def calcBollinger(data, size):
-            df = data.copy()
-            price_column = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
-            df["sma"] = df[price_column].rolling(size).mean()
-            df["bolu"] = df["sma"] + 2 * df[price_column].rolling(size).std(ddof=0)
-            df["bold"] = df["sma"] - 2 * df[price_column].rolling(size).std(ddof=0)
-            df["width"] = df["bolu"] - df["bold"]
-            df.dropna(inplace=True)
-            return df
+            return df`
 
         st.title('Company Stocks Advanced Details')
         st.subheader('Moving Average')
