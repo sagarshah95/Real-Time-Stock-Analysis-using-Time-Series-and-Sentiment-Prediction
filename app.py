@@ -451,55 +451,7 @@ def main():
         st.plotly_chart(figMACD, use_container_width=True)
 
 
-        st.subheader('Bollinger Band')
-        coBoll1, coBoll2 = st.columns(2)
-        with coBoll1:
-            numYearBoll = st.number_input('Insert period (Year): ', min_value=1, max_value=10, value=2, key=6) 
-
-        with coBoll2:
-            windowSizeBoll = st.number_input('Window Size (Day): ', min_value=5, max_value=500, value=20, key=7)
-
-        startBoll = dt.datetime.today() - dt.timedelta(numYearBoll * 365)
-        endBoll = dt.datetime.today()
-        dataBoll = yf.download(ticker, startBoll, endBoll)
-        df_boll = calcBollinger(dataBoll, windowSizeBoll)
-        df_boll = df_boll.reset_index()
-
-        figBoll = go.Figure()
-        figBoll.add_trace(
-            go.Scatter(
-                x = df_boll['Date'],
-                y = df_boll['bolu'],
-                name = "Upper Band"
-            )
-        )
-
-        figBoll.add_trace(
-            go.Scatter(
-                x = df_boll['Date'],
-                y = df_boll['sma'],
-                name = "SMA" + str(windowSizeBoll) + " Over Last " + str(numYearBoll) + " Year(s)"
-            )
-        )
-
-        figBoll.add_trace(
-            go.Scatter(
-                x = df_boll['Date'],
-                y = df_boll['bold'],
-                name = "Lower Band"
-            )
-        )
-
-        figBoll.update_layout(legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1,
-            xanchor="left",
-            x=0
-        ))
-
-        figBoll.update_yaxes(tickprefix="$")
-        st.plotly_chart(figBoll, use_container_width=True)
+        
 
 
 
