@@ -107,7 +107,7 @@ def main():
     verified = "True"
     result = "F.A.S.T. WebApp"
     st.sidebar.title(result)
-    st.sidebar.write("Created By: Sagar Shah [LinkedIn](https://www.linkedin.com/in/shahsagar95/)")
+    st.sidebar.write("Created By: Kunal Sanghavi [LinkedIn](https://www.linkedin.com/in/kunalsanghvii/)")
 
     page = st.sidebar.radio("Choose a Function", ["About the Project","Live News Sentiment","Company Basic Details","Company Advanced Details","Google Trends with Forecast","Twitter Trends", "Meeting Summarization"])
     
