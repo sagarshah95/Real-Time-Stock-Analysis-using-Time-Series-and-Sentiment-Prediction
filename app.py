@@ -17,10 +17,33 @@ def install_requirements():
 
 
 def main():
-
-    install_requirements()
+    # Dependencies should be installed once in the environment.
+    # Re-installing on every Streamlit rerun is slow and fragile.
 
     import streamlit as st
+
+    from ui_theme import (
+        APP_BRAND_FULL,
+        init_theme_state,
+        inject_global_css,
+        render_top_bar,
+        render_sidebar_navigation,
+        render_right_rail_placeholder,
+        render_company_hero,
+        render_metric_strip,
+        page_title,
+    )
+
+    st.set_page_config(
+        page_title=APP_BRAND_FULL,
+        page_icon="📈",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+
+    init_theme_state(st)
+    inject_global_css(st)
+    render_top_bar(st)
     from os import listdir
     from os.path import isfile, join
 
@@ -29,6 +52,7 @@ def main():
     import pandas as pd
     import numpy as np
     import yfinance as yf
+    from yfinance.exceptions import YFRateLimitError
     import datetime as dt
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
@@ -38,13 +62,25 @@ def main():
 
     import matplotlib.pyplot as plt
 
-    from prophet import Prophet
-    from prophet.plot import plot_plotly
+    try:
+        from prophet import Prophet
+        from prophet.plot import plot_plotly
+        prophet_available = True
+    except Exception:
+        Prophet = None
+        plot_plotly = None
+        prophet_available = False
+
+    # Some environments import Prophet but fail at runtime
+    # due to missing/invalid Stan backend.
+    if prophet_available:
+        try:
+            _ = Prophet()
+        except Exception:
+            prophet_available = False
     from pytrends.request import TrendReq
 
-    import tweepy
     import json
-    from tweepy import OAuthHandler
     import re
     import textblob
     from textblob import TextBlob
@@ -81,6 +117,141 @@ def main():
         return 0
     df = load_data()
 
+    def safe_summarize(text, ratio):
+        """
+        Lightweight fallback summarizer when external summarization
+        libraries are not available.
+        """
+        cleaned_ratio = max(0.01, min(float(ratio), 1.0))
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+        if not sentences:
+            return "No text available to summarize."
+        keep_count = max(1, int(len(sentences) * cleaned_ratio))
+        return " ".join(sentences[:keep_count])
+
+    def normalize_market_df(df):
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        normalized = df.copy()
+
+        # Flatten MultiIndex columns from yfinance (order is often Ticker × OHLCV).
+        if isinstance(normalized.columns, pd.MultiIndex):
+            ohlcv = {'Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume'}
+            level0 = set(normalized.columns.get_level_values(0).unique())
+            level1 = set(normalized.columns.get_level_values(1).unique())
+            if ohlcv.intersection(level1) and not ohlcv.intersection(level0):
+                normalized.columns = normalized.columns.get_level_values(1)
+            elif ohlcv.intersection(level0) and not ohlcv.intersection(level1):
+                normalized.columns = normalized.columns.get_level_values(0)
+            else:
+                # Prefer the level that contains typical price field names.
+                if len(ohlcv.intersection(level1)) >= len(ohlcv.intersection(level0)):
+                    normalized.columns = normalized.columns.get_level_values(1)
+                else:
+                    normalized.columns = normalized.columns.get_level_values(0)
+
+        return normalized
+
+    def get_price_column(df):
+        if 'Adj Close' in df.columns:
+            return 'Adj Close'
+        if 'Close' in df.columns:
+            return 'Close'
+        return None
+
+    @st.cache_data(ttl=300, show_spinner=False)
+    def cached_company_info(sym):
+        return yf.Ticker(sym).info
+
+    @st.cache_data(ttl=300, show_spinner=False)
+    def cached_history_data(sym, start_s=None, end_s=None):
+        t = yf.Ticker(sym)
+        hist = t.history(
+            start=start_s,
+            end=end_s,
+            interval='1d',
+            auto_adjust=False,
+            actions=False,
+        )
+        return hist
+
+    @st.cache_data(ttl=300, show_spinner=False)
+    def cached_download_data(sym, start_s=None, end_s=None):
+        return yf.download(
+            sym,
+            start=start_s,
+            end=end_s,
+            auto_adjust=False,
+            progress=False,
+        )
+
+    def _ohlcv_from_history(sym, start=None, end=None, ticker=None):
+        """Single-symbol OHLCV via Ticker.history — usually more reliable than download()."""
+        start_s = start.strftime('%Y-%m-%d') if hasattr(start, 'strftime') else start
+        end_s = end.strftime('%Y-%m-%d') if hasattr(end, 'strftime') else end
+        hist = cached_history_data(sym, start_s, end_s)
+        if hist is None or hist.empty:
+            return pd.DataFrame()
+        out = hist.reset_index()
+        # yfinance uses 'Date' or 'Datetime' for the first column depending on version
+        if 'Date' not in out.columns:
+            if 'Datetime' in out.columns:
+                out = out.rename(columns={'Datetime': 'Date'})
+            elif len(out.columns) > 0:
+                first = out.columns[0]
+                if str(first).lower() in ('date', 'datetime', 'index') or pd.api.types.is_datetime64_any_dtype(out[first]):
+                    out = out.rename(columns={first: 'Date'})
+        return normalize_market_df(out)
+
+    def safe_yf_download(ticker, start=None, end=None, ticker_obj=None):
+        sym = str(ticker).strip()
+        if not sym:
+            return pd.DataFrame()
+
+        start_s = start.strftime('%Y-%m-%d') if hasattr(start, 'strftime') else start
+        end_s = end.strftime('%Y-%m-%d') if hasattr(end, 'strftime') else end
+
+        try:
+            data = _ohlcv_from_history(sym, start=start, end=end, ticker=ticker_obj)
+            if not data.empty:
+                st.session_state[f"last_prices_{sym}"] = data.copy()
+                return data
+
+            data = cached_download_data(sym, start_s, end_s)
+            data = normalize_market_df(data)
+            if data.empty:
+                cached = st.session_state.get(f"last_prices_{sym}")
+                if isinstance(cached, pd.DataFrame) and not cached.empty:
+                    st.info("Using cached market data due to temporary Yahoo response issues.")
+                    return cached.copy()
+                st.warning("No market data returned. Please try a different ticker or try again later.")
+                return pd.DataFrame()
+            if 'Date' not in data.columns and isinstance(data.index, pd.DatetimeIndex):
+                data = data.reset_index()
+                if len(data.columns) > 0 and data.columns[0] != 'Date':
+                    data = data.rename(columns={data.columns[0]: 'Date'})
+            elif 'Date' not in data.columns and len(data.columns) > 0:
+                data = data.reset_index()
+                if data.columns[0] != 'Date':
+                    data = data.rename(columns={data.columns[0]: 'Date'})
+            st.session_state[f"last_prices_{sym}"] = data.copy()
+            return data
+        except YFRateLimitError:
+            cached = st.session_state.get(f"last_prices_{sym}")
+            if isinstance(cached, pd.DataFrame) and not cached.empty:
+                st.info("Yahoo rate limited. Showing cached market data.")
+                return cached.copy()
+            st.error("Yahoo Finance rate limit reached. Please wait a minute and try again.")
+            return pd.DataFrame()
+        except Exception:
+            cached = st.session_state.get(f"last_prices_{sym}")
+            if isinstance(cached, pd.DataFrame) and not cached.empty:
+                st.info("Using cached market data due to temporary fetch issues.")
+                return cached.copy()
+            st.error("Failed to fetch market data right now. Please try again shortly.")
+            return pd.DataFrame()
+
     def get_data(keyword):
         keyword = [keyword]
         pytrend = TrendReq()
@@ -91,31 +262,130 @@ def main():
         df.columns = ["ds", "y"]
         return df
 
-# make forecasts for a new period
-    def make_pred(df, periods):
-        prophet_basic = Prophet()
-        prophet_basic.fit(df)
-        future = prophet_basic.make_future_dataframe(periods=periods)
-        forecast = prophet_basic.predict(future)
-        fig1 = prophet_basic.plot(forecast, xlabel="date", ylabel="trend", figsize=(10, 6))
-        fig2 = prophet_basic.plot_components(forecast)
-        forecast = forecast[["ds", "yhat"]]
+    def make_pred_simple(df, periods):
+        """
+        Prophet-free forecast: polynomial trend on time + simple component views.
+        Google Trends scores are clipped to [0, 100].
+        """
+        d = df.copy()
+        d['ds'] = pd.to_datetime(d['ds'], errors='coerce')
+        d['y'] = pd.to_numeric(d['y'], errors='coerce').ffill().bfill()
+        d = d.dropna(subset=['ds'])
+        if len(d) < 3:
+            st.error('Not enough trend history to build a forecast.')
+            st.stop()
+
+        last_date = d['ds'].max()
+        future_dates = pd.date_range(
+            start=last_date + pd.Timedelta(days=1),
+            periods=int(periods),
+            freq='D',
+        )
+        hist_ds = d['ds'].reset_index(drop=True)
+        all_ds = pd.concat([hist_ds, pd.Series(future_dates)], ignore_index=True)
+
+        t0 = d['ds'].min()
+        x = (d['ds'] - t0).dt.days.values.astype(float)
+        y = d['y'].values.astype(float)
+        deg = min(2, max(1, len(x) - 2))
+        coef = np.polyfit(x, y, deg=deg)
+        poly = np.poly1d(coef)
+        x_all = (pd.to_datetime(all_ds) - t0).dt.days.values.astype(float)
+        yhat = np.clip(poly(x_all), 0.0, 100.0)
+
+        forecast = pd.DataFrame({'ds': pd.to_datetime(all_ds), 'yhat': yhat})
+
+        fig1, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(d['ds'], d['y'], 'k.', label='Actual', markersize=4)
+        ax.plot(forecast['ds'], forecast['yhat'], color='#0072B2', linewidth=1.5, label='Forecast (trend model)')
+        ax.set_xlabel('date')
+        ax.set_ylabel('trend')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig1.tight_layout()
+
+        fig2, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+        monthly = d.set_index('ds')['y'].resample('ME').mean()
+        ax1.plot(monthly.index, monthly.values, color='#D55E00')
+        ax1.set_title('Monthly average (historical)')
+        ax1.grid(True, alpha=0.3)
+        dow_means = d.groupby(d['ds'].dt.dayofweek, sort=True)['y'].mean()
+        ax2.bar(dow_means.index, dow_means.values, color='#009E73')
+        ax2.set_xticks(range(7))
+        ax2.set_xticklabels(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'])
+        ax2.set_title('Average by weekday')
+        ax2.grid(True, alpha=0.3)
+        fig2.tight_layout()
 
         return forecast, fig1, fig2
 
+    def make_pred(df, periods, show_fallback_caption=True):
+        if prophet_available:
+            try:
+                prophet_basic = Prophet()
+                prophet_basic.fit(df)
+                future = prophet_basic.make_future_dataframe(periods=periods)
+                forecast = prophet_basic.predict(future)
+                fig1 = prophet_basic.plot(forecast, xlabel='date', ylabel='trend', figsize=(10, 6))
+                fig2 = prophet_basic.plot_components(forecast)
+                forecast = forecast[['ds', 'yhat']]
+                return forecast, fig1, fig2
+            except Exception:
+                pass
+        if show_fallback_caption:
+            st.caption('Using built-in trend forecast (Prophet is not installed or not usable on this machine).')
+        return make_pred_simple(df, periods)
+
+    def _stock_forecast_fallback(df_train, period_days, n_years):
+        d = df_train.dropna(subset=['ds', 'y']).copy()
+        if len(d) < 5:
+            st.error('Not enough price history to forecast.')
+            st.stop()
+        t0 = d['ds'].min()
+        x = (d['ds'] - t0).dt.days.values.astype(float)
+        y = d['y'].values.astype(float)
+        coef = np.polyfit(x, y, 1)
+        poly = np.poly1d(coef)
+        last = d['ds'].max()
+        future = pd.date_range(last + pd.Timedelta(days=1), periods=int(period_days), freq='D')
+        all_ds = pd.concat([d['ds'].reset_index(drop=True), pd.Series(future)], ignore_index=True)
+        x_all = (pd.to_datetime(all_ds) - t0).dt.days.values.astype(float)
+        yhat = np.maximum(poly(x_all), 1e-6)
+        forecast = pd.DataFrame({'ds': pd.to_datetime(all_ds), 'yhat': yhat})
+        st.subheader('Forecast data')
+        st.write(forecast.tail())
+        st.write(f'Forecast plot for {n_years} years (linear trend)')
+        figp = go.Figure()
+        figp.add_trace(go.Scatter(x=d['ds'], y=d['y'], name='Close (historical)'))
+        figp.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat'], name='Forecast', line=dict(dash='dash')))
+        figp.update_layout(title_text='Price and linear trend forecast')
+        st.plotly_chart(figp, use_container_width=True)
+        st.write('Forecast components (approx.)')
+        figc, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+        monthly = d.set_index('ds')['y'].resample('ME').mean()
+        ax1.plot(monthly.index, monthly.values, color='#D55E00')
+        ax1.set_title('Monthly average close (historical)')
+        ax1.grid(True, alpha=0.3)
+        resid = y - poly(x)
+        ax2.hist(resid, bins=30, color='#009E73', alpha=0.8)
+        ax2.set_title('Residuals vs linear trend (historical)')
+        ax2.grid(True, alpha=0.3)
+        figc.tight_layout()
+        st.pyplot(figc)
+
 
     verified = "True"
-    result = "F.A.S.T. WebApp"
-    st.sidebar.title(result)
-    #st.sidebar.write("Created By: Kunal Sanghavi [LinkedIn](https://www.linkedin.com/in/kunalsanghvii/)")
+    result = APP_BRAND_FULL
 
-    page = st.sidebar.radio("Choose a Function", ["About the Project","Live News Sentiment","Company Basic Details","Company Advanced Details","Google Trends with Forecast","Twitter Trends", "Meeting Summarization"])
-    
+    page = render_sidebar_navigation(st)
+    inject_global_css(st)
+
     
     
 
 
     if page == "Google Trends with Forecast":
+        page_title(st, "Search trends", "Keyword interest from Google Trends with forecast")
         st.sidebar.write("""
         ## Choose a keyword and a prediction period 
         """)
@@ -132,7 +402,7 @@ def main():
         st.write("Evolution of interest:", keyword)
 
         df = get_data(keyword)
-        forecast, fig1, fig2 = make_pred(df, periods)
+        forecast, fig1, fig2 = make_pred(df, periods, show_fallback_caption=True)
 
         st.pyplot(fig1)
             
@@ -141,29 +411,33 @@ def main():
         st.pyplot(fig2)
 
     elif page == "About the Project":
+        page_title(st, "Overview", "Data sources, architecture, and embedded dashboard")
+        col_main, col_rail = st.columns([2.2, 1])
+        with col_main:
+            st.title('Data Sources')
+            st.write("""
+            ### Our F.A.S.T application have 3 data sources for two different use cases:
+            #### 1. Web Scrapping to get Live News Data
+            #### 2. Twitter API to get Real time Tweets
+            #### 3. Google Trends API to get Real time Trends
+            """)
+            st.text('')
 
-        st.title('Data Sources')
-        st.write("""
-        ### Our F.A.S.T application have 3 data sources for two different use cases:
-        #### 1. Web Scrapping to get Live News Data
-        #### 2. Twitter API to get Real time Tweets
-        #### 3. Google Trends API to get Real time Trends
-        """)
-        st.text('')
+            link = '[Project Report](https://github.com/sagarshah95/Financial-Real-Time-Stock-Analysis-using-Sentiment-Analysis-and-Time-Series-Forecasting-AWS/blob/main/README.md)'
+            st.markdown(link, unsafe_allow_html=True)
 
-        link = '[Project Report](https://github.com/sagarshah95/Financial-Real-Time-Stock-Analysis-using-Sentiment-Analysis-and-Time-Series-Forecasting-AWS/blob/main/README.md)'
-        st.markdown(link, unsafe_allow_html=True)
+            st.title('AWS Data Architecture')
+            st.image('./Images/Architecture Final AWS_FAST.jpg', width=900, use_container_width=True)
 
-        
-        st.title('AWS Data Architecture')
-        st.image('./Images/Architecture Final AWS_FAST.jpg',width=900, use_container_width=True)
-
-        st.title('Dashboard')
-        import streamlit.components.v1 as components
-        components.iframe("https://app.powerbi.com/reportEmbed?reportId=ae040e1c-7da3-4b0b-bd58-844abe577eea&autoAuth=true&ctid=a8eec281-aaa3-4dae-ac9b-9a398b9215e7", height=400, width = 800)
+            st.title('Dashboard')
+            import streamlit.components.v1 as components
+            components.iframe("https://app.powerbi.com/reportEmbed?reportId=ae040e1c-7da3-4b0b-bd58-844abe577eea&autoAuth=true&ctid=a8eec281-aaa3-4dae-ac9b-9a398b9215e7", height=400, width=800)
+        with col_rail:
+            render_right_rail_placeholder(st)
 
     
     elif page == "Meeting Summarization":
+        page_title(st, "Meeting notes", "Audio preview and text summary helpers")
 
         symbols = ['./Audio Files/Meeting 1.mp3','./Audio Files/Meeting 2.mp3', './Audio Files/Meeting 3.mp3', './Audio Files/Meeting 4.mp3']
 
@@ -183,7 +457,7 @@ def main():
                 time.sleep(1.4)
                 try:
                     with open(data_dir + user_input) as f:
-                        st.success(summarize(f.read(), ratio=float(ratiodata)))          
+                        st.success(safe_summarize(f.read(), ratio=float(ratiodata)))          
                         #print()
                         st.warning("Sentiment: Negative")
                 except:
@@ -194,13 +468,14 @@ def main():
                 time.sleep(1.4)
                 try:
                     with open(data_dir + user_input) as f:
-                        st.success(summarize(f.read(), ratio=float(ratiodata)))          
+                        st.success(safe_summarize(f.read(), ratio=float(ratiodata)))          
                         #print()
                         st.success("Sentiment: Positive")
                 except:
                     st.text("Please Enter a valid Decimal value like 0.01")
 
     elif page == "Twitter Trends":
+        page_title(st, "Social trends", "Interest-over-time style chart for your keyword")
         st.write("""
         # Welcome to Twitter Sentiment App
         ### This app predicts the **Twitter Sentiments** you want!
@@ -213,29 +488,21 @@ def main():
         """)
         keyword = st.sidebar.text_input("Keyword", "Amazon")
         periods = st.sidebar.slider('Prediction time in days:', 7, 365, 90)
-        
 
-        # main section
-        st.write("""
-        # Welcome to Trend Predictor App
-        ### This app predicts the **Google Trend** you want!
-        """)
-        st.image('https://media.tenor.com/xfmMlSJRvdoAAAAC/google-voice-search.gif',width=350, use_container_width=True)
-        st.write("Evolution of interest:", keyword)
+        st.subheader(f"Interest over time: **{keyword}**")
 
         df = get_data(keyword)
-        forecast, fig1, fig2 = make_pred(df, periods)
+        forecast, fig1, fig2 = make_pred(df, periods, show_fallback_caption=False)
 
         st.pyplot(fig1)
-            
-        
-        st.write("Trends Over the Years and Months")
+        st.write("Trends over the years and months")
         st.pyplot(fig2)
 
 
 
         
     elif page == "Stock Future Prediction":
+        page_title(st, "Stock forecast", "Historical prices and forward projection")
         snp500 = pd.read_csv("./Datasets/SP500.csv")
         symbols = snp500['Symbol'].sort_values().tolist()   
 
@@ -246,8 +513,6 @@ def main():
         START = "2015-01-01"
         TODAY = date.today().strftime("%Y-%m-%d")
 
-        st.title('Stock Forecast App')
-
         st.image('https://media2.giphy.com/media/JtBZm3Getg3dqxK0zP/giphy-downsized-large.gif', width=250, use_container_width=True)
 
         n_years = st.slider('Years of prediction:', 1, 4)
@@ -255,7 +520,9 @@ def main():
 
         data_load_state = st.text('Loading data...')
 
-        data = yf.download(ticker, START, TODAY)
+        data = safe_yf_download(ticker, START, TODAY)
+        if data.empty:
+            st.stop()
         data.reset_index(inplace=True)
         data_load_state.text('Loading data... done!')
 
@@ -272,33 +539,38 @@ def main():
             
         plot_raw_data()
 
-        # Predict forecast with Prophet.
-        df_train = data[['Date', 'Close']]
-        df_train = df_train.rename(columns={"Date": "ds", "Close": "y"})
-        df_train['y'] = pd.to_numeric(df_train['y'], errors='coerce')
+        df_train = data[['Date', 'Close']].copy()
+        df_train = df_train.rename(columns={'Date': 'ds', 'Close': 'y'})
+        df_train['ds'] = pd.to_datetime(df_train['ds'], errors='coerce')
+        df_train['y'] = pd.to_numeric(df_train['y'], errors='coerce').ffill().bfill()
 
-        m = Prophet()
-        m.fit(df_train)
-        future = m.make_future_dataframe(periods=period)
-        forecast = m.predict(future)
-
-        # Show and plot forecast
-        st.subheader('Forecast data')
-        st.write(forecast.tail())
-            
-        st.write(f'Forecast plot for {n_years} years')
-        fig1 = plot_plotly(m, forecast)
-        st.plotly_chart(fig1)
-
-        st.write("Forecast components")
-        fig2 = m.plot_components(forecast)
-        st.write(fig2)
+        if prophet_available and plot_plotly is not None:
+            try:
+                m = Prophet()
+                m.fit(df_train)
+                future = m.make_future_dataframe(periods=period)
+                forecast = m.predict(future)
+                st.subheader('Forecast data')
+                st.write(forecast.tail())
+                st.write(f'Forecast plot for {n_years} years')
+                fig1 = plot_plotly(m, forecast)
+                st.plotly_chart(fig1)
+                st.write('Forecast components')
+                fig2 = m.plot_components(forecast)
+                st.pyplot(fig2)
+            except Exception:
+                st.caption('Prophet failed; using linear trend forecast instead.')
+                _stock_forecast_fallback(df_train, period, n_years)
+        else:
+            st.caption('Using linear trend forecast (Prophet is not installed or not usable on this machine).')
+            _stock_forecast_fallback(df_train, period, n_years)
 
 
 
 
     
     elif page == "Company Advanced Details":
+        page_title(st, "Technicals", "Moving averages and MACD")
         snp500 = pd.read_csv("./Datasets/SP500.csv")
         symbols = snp500['Symbol'].sort_values().tolist()   
 
@@ -306,11 +578,11 @@ def main():
             'Choose a S&P 500 Stock',
             symbols)
 
-        stock = yf.Ticker(ticker)
-
         def calcMovingAverage(data, size):
             df = data.copy()
-            price_column = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
+            price_column = get_price_column(df)
+            if price_column is None:
+                return pd.DataFrame()
             df['sma'] = df[price_column].rolling(size).mean()
             df['ema'] = df[price_column].ewm(span=size, min_periods=size).mean()
             df.dropna(inplace=True)
@@ -318,7 +590,9 @@ def main():
 
         def calc_macd(data):
             df = data.copy()
-            price_column = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
+            price_column = get_price_column(df)
+            if price_column is None:
+                return pd.DataFrame()
             df['ema12'] = df[price_column].ewm(span=12, min_periods=12).mean()
             df['ema26'] = df[price_column].ewm(span=26, min_periods=26).mean()
             df['macd'] = df['ema12'] - df['ema26']
@@ -326,7 +600,6 @@ def main():
             df.dropna(inplace=True)
             return df
 
-        st.title('Company Stocks Advanced Details')
         st.subheader('Moving Average')
 
         coMA1, coMA2 = st.columns(2)
@@ -339,16 +612,25 @@ def main():
 
         start = dt.datetime.today() - dt.timedelta(numYearMA * 365)
         end = dt.datetime.today()
-        dataMA = yf.download(ticker, start, end)
+        dataMA = safe_yf_download(ticker, start, end)
+        if dataMA.empty:
+            st.stop()
         df_ma = calcMovingAverage(dataMA, windowSizeMA)
+        if df_ma.empty:
+            st.warning("Not enough data available for moving average calculation.")
+            st.stop()
         df_ma = df_ma.reset_index()
+        price_col_ma = get_price_column(df_ma)
+        if price_col_ma is None:
+            st.warning("Price column missing in downloaded data.")
+            st.stop()
 
         figMA = go.Figure()
 
         figMA.add_trace(
             go.Scatter(
                 x = df_ma['Date'],
-                y = df_ma['Adj Close'] if 'Adj Close' in df_ma.columns else df_ma['Close'],
+                y = df_ma[price_col_ma],
                 name = "Prices Over Last " + str(numYearMA) + " Year(s)"
             )
         )
@@ -386,9 +668,18 @@ def main():
 
         startMACD = dt.datetime.today() - dt.timedelta(numYearMACD * 365)
         endMACD = dt.datetime.today()
-        dataMACD = yf.download(ticker, startMACD, endMACD)
+        dataMACD = safe_yf_download(ticker, startMACD, endMACD)
+        if dataMACD.empty:
+            st.stop()
         df_macd = calc_macd(dataMACD)
+        if df_macd.empty:
+            st.warning("Not enough data available for MACD calculation.")
+            st.stop()
         df_macd = df_macd.reset_index()
+        price_col_macd = get_price_column(df_macd)
+        if price_col_macd is None:
+            st.warning("Price column missing in downloaded data.")
+            st.stop()
 
         figMACD = make_subplots(rows=2, cols=1,
                                 shared_xaxes=True,
@@ -397,10 +688,12 @@ def main():
         figMACD.add_trace(
             go.Scatter(
                 x = df_macd['Date'],
-                y = df_macd['Adj Close'] if 'Adj Close' in df_macd.columns else df_macd['Close'],
+                y = df_macd[price_col_macd],
                 name = "Prices Over Last " + str(numYearMACD) + " Year(s)"
         
-        ))
+        ),
+            row=1, col=1
+        )
 
         figMACD.add_trace(
             go.Scatter(
@@ -449,6 +742,7 @@ def main():
 
 
     elif page == "Live News Sentiment":
+        page_title(st, "News & sentiment", "Headlines and VADER scores from Finviz")
         st.image('https://www.visitashland.com/files/latestnews.jpg', width=250, use_container_width=True)
 
         snp500 = pd.read_csv("./Datasets/SP500.csv")
@@ -530,85 +824,107 @@ def main():
             'Choose a S&P 500 Stock',
             symbols)
 
-        stock = yf.Ticker(ticker)
-        info = stock.info 
-        st.title('Company Basic Details')
-        st.subheader(info.get('longName', 'N/A')) 
-        st.markdown('** Sector **: ' + info.get('sector', 'N/A'))
-        st.markdown('** Industry **: ' + info.get('industry', 'N/A'))
-        st.markdown('** Phone **: ' + info.get('phone', 'N/A'))
-        st.markdown('** Address **: ' + info.get('address1', 'N/A') + ', ' + info.get('city', 'N/A') + ', ' + info.get('zip', 'N/A') + ', '  +  info.get('country', 'N/A'))
-        st.markdown('** Website **: ' + info.get('website', 'N/A'))
-        st.markdown('** Business Summary **')
-        st.info(info.get('longBusinessSummary', 'N/A'))
-            
-        fundInfo = {
-            'Enterprise Value (USD)': info.get('enterpriseValue', 'N/A'),
-            'Enterprise To Revenue Ratio': info.get('enterpriseToRevenue', 'N/A'),
-            'Enterprise To Ebitda Ratio': info.get('enterpriseToEbitda', 'N/A'),
-            'Net Income (USD)': info.get('netIncomeToCommon', 'N/A'),
-            'Profit Margin Ratio': info.get('profitMargins', 'N/A'),
-            'Forward PE Ratio': info.get('forwardPE', 'N/A'),
-            'PEG Ratio': info.get('pegRatio', 'N/A'),
-            'Price to Book Ratio': info.get('priceToBook', 'N/A'),
-            'Forward EPS (USD)': info.get('forwardEps', 'N/A'),
-            'Beta ': info.get('beta', 'N/A'),
-            'Book Value (USD)': info.get('bookValue', 'N/A'),
-            'Dividend Rate (%)': info.get('dividendRate', 'N/A'), 
-            'Dividend Yield (%)': info.get('dividendYield', 'N/A'),
-            'Five year Avg Dividend Yield (%)': info.get('fiveYearAvgDividendYield', 'N/A'),
-            'Payout Ratio': info.get('payoutRatio', 'N/A')
-        }
-        
-        fundDF = pd.DataFrame.from_dict(fundInfo, orient='index', columns=['Value'])
-        st.subheader('Fundamental Info') 
-        st.table(fundDF)
-        
-        st.subheader('General Stock Info') 
-        st.markdown('** Market **: ' + info.get('market', 'N/A'))
-        st.markdown('** Exchange **: ' + info.get('exchange', 'N/A'))
-        st.markdown('** Quote Type **: ' + info.get('quoteType', 'N/A'))
-        
-        start = dt.datetime.today() - dt.timedelta(2 * 365)
-        end = dt.datetime.today()
-        df = yf.download(ticker, start, end)
-        df = df.reset_index()
+        try:
+            info = cached_company_info(ticker)
+            if isinstance(info, dict) and info:
+                st.session_state[f"last_info_{ticker}"] = info
+        except YFRateLimitError:
+            info = st.session_state.get(f"last_info_{ticker}", {})
+            if info:
+                st.info("Yahoo rate limited. Showing cached company details.")
+            else:
+                st.error("Yahoo Finance rate limit reached. Please wait a minute and try again.")
+                st.stop()
+        except Exception:
+            info = st.session_state.get(f"last_info_{ticker}", {})
+            if info:
+                st.info("Unable to refresh company details. Showing cached data.")
+            else:
+                st.error("Unable to fetch company details right now. Please try again shortly.")
+                st.stop()
+        page_title(st, "Company profile", "Fundamentals, narrative, and price history")
+        col_cb, col_cb_rail = st.columns([2.4, 1])
+        with col_cb:
+            render_company_hero(st, ticker, info if isinstance(info, dict) else {})
+            render_metric_strip(st, info if isinstance(info, dict) else {})
+            st.markdown('** Sector **: ' + str(info.get('sector', 'N/A')))
+            st.markdown('** Industry **: ' + str(info.get('industry', 'N/A')))
+            st.markdown('** Phone **: ' + str(info.get('phone', 'N/A')))
+            st.markdown('** Address **: ' + str(info.get('address1', 'N/A')) + ', ' + str(info.get('city', 'N/A')) + ', ' + str(info.get('zip', 'N/A')) + ', ' + str(info.get('country', 'N/A')))
+            st.markdown('** Website **: ' + str(info.get('website', 'N/A')))
+            st.markdown('** Business summary**')
+            st.info(info.get('longBusinessSummary', 'N/A'))
 
-        # Check if 'Adj Close' column exists, otherwise use 'Close'
-        if 'Adj Close' in df.columns:
-            price_column = 'Adj Close'
-        else:
-            price_column = 'Close'
-
-        fig = go.Figure(
-            data=go.Scatter(x=df['Date'], y=df[price_column])
-        )
-        fig.update_layout(
-            title={
-                'text': "Stock Prices Over Past Two Years",
-                'y': 0.9,
-                'x': 0.5,
-                'xanchor': 'center',
-                'yanchor': 'top'
+            fundInfo = {
+                'Enterprise Value (USD)': info.get('enterpriseValue', 'N/A'),
+                'Enterprise To Revenue Ratio': info.get('enterpriseToRevenue', 'N/A'),
+                'Enterprise To Ebitda Ratio': info.get('enterpriseToEbitda', 'N/A'),
+                'Net Income (USD)': info.get('netIncomeToCommon', 'N/A'),
+                'Profit Margin Ratio': info.get('profitMargins', 'N/A'),
+                'Forward PE Ratio': info.get('forwardPE', 'N/A'),
+                'PEG Ratio': info.get('pegRatio', 'N/A'),
+                'Price to Book Ratio': info.get('priceToBook', 'N/A'),
+                'Forward EPS (USD)': info.get('forwardEps', 'N/A'),
+                'Beta ': info.get('beta', 'N/A'),
+                'Book Value (USD)': info.get('bookValue', 'N/A'),
+                'Dividend Rate (%)': info.get('dividendRate', 'N/A'),
+                'Dividend Yield (%)': info.get('dividendYield', 'N/A'),
+                'Five year Avg Dividend Yield (%)': info.get('fiveYearAvgDividendYield', 'N/A'),
+                'Payout Ratio': info.get('payoutRatio', 'N/A')
             }
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
-        marketInfo = {
-            "Volume": info.get('volume', 'N/A'),
-            "Average Volume": info.get('averageVolume', 'N/A'),
-            "Market Cap": info.get("marketCap", 'N/A'),
-            "Float Shares": info.get('floatShares', 'N/A'),
-            "Regular Market Price (USD)": info.get('regularMarketPrice', 'N/A'),
-            'Bid Size': info.get('bidSize', 'N/A'),
-            'Ask Size': info.get('askSize', 'N/A'),
-            "Share Short": info.get('sharesShort', 'N/A'),
-            'Short Ratio': info.get('shortRatio', 'N/A'),
-            'Share Outstanding': info.get('sharesOutstanding', 'N/A')
-        }
-        
-        marketDF = pd.DataFrame(data=marketInfo, index=[0])
-        st.table(marketDF)
+
+            fundDF = pd.DataFrame.from_dict(fundInfo, orient='index', columns=['Value'])
+            st.subheader('Fundamental Info')
+            st.table(fundDF)
+
+            st.subheader('General Stock Info')
+            st.markdown('** Market **: ' + str(info.get('market', 'N/A')))
+            st.markdown('** Exchange **: ' + str(info.get('exchange', 'N/A')))
+            st.markdown('** Quote Type **: ' + str(info.get('quoteType', 'N/A')))
+
+            start = dt.datetime.today() - dt.timedelta(2 * 365)
+            end = dt.datetime.today()
+            df = safe_yf_download(ticker, start, end)
+            if df.empty:
+                st.stop()
+            df = df.reset_index()
+
+            price_column = get_price_column(df)
+            if price_column is None:
+                st.warning("Price column missing in downloaded data.")
+                st.stop()
+
+            fig = go.Figure(
+                data=go.Scatter(x=df['Date'], y=df[price_column])
+            )
+            fig.update_layout(
+                title={
+                    'text': "Stock Prices Over Past Two Years",
+                    'y': 0.9,
+                    'x': 0.5,
+                    'xanchor': 'center',
+                    'yanchor': 'top'
+                }
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            marketInfo = {
+                "Volume": info.get('volume', 'N/A'),
+                "Average Volume": info.get('averageVolume', 'N/A'),
+                "Market Cap": info.get("marketCap", 'N/A'),
+                "Float Shares": info.get('floatShares', 'N/A'),
+                "Regular Market Price (USD)": info.get('regularMarketPrice', 'N/A'),
+                'Bid Size': info.get('bidSize', 'N/A'),
+                'Ask Size': info.get('askSize', 'N/A'),
+                "Share Short": info.get('sharesShort', 'N/A'),
+                'Short Ratio': info.get('shortRatio', 'N/A'),
+                'Share Outstanding': info.get('sharesOutstanding', 'N/A')
+            }
+
+            marketDF = pd.DataFrame(data=marketInfo, index=[0])
+            st.table(marketDF)
+        with col_cb_rail:
+            render_right_rail_placeholder(st)
 
 
     else:
