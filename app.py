@@ -31,6 +31,11 @@ def main():
         render_right_rail_placeholder,
         render_company_hero,
         render_metric_strip,
+        render_dashboard_hero,
+        render_section_card_start,
+        render_section_card_end,
+        render_insight_card,
+        render_sentiment_badge,
         page_title,
     )
 
@@ -103,6 +108,150 @@ def main():
     import plotly.express as px
     #from gensim.summarization import summarize
     #from transformers import pipeline as summarize
+
+    def apply_plotly_dark(fig, height=420):
+        fig.update_layout(
+            template="plotly_dark",
+            height=height,
+            margin=dict(l=20, r=20, t=40, b=20),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="left",
+                x=0
+            ),
+        )
+        fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.08)")
+        fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.08)")
+        return fig
+
+    def compute_quick_stats(info, price_df):
+        stats = {
+            "price": "—",
+            "change_pct": "—",
+            "volume": "—",
+            "signal": "Neutral",
+        }
+
+        try:
+            price = info.get("regularMarketPrice") or info.get("currentPrice")
+            prev = info.get("previousClose")
+            if price is not None:
+                stats["price"] = f"${float(price):,.2f}"
+            if price is not None and prev not in (None, 0):
+                pct = ((float(price) - float(prev)) / float(prev)) * 100
+                stats["change_pct"] = f"{pct:+.2f}%"
+
+            vol = info.get("volume")
+            if vol is not None:
+                if vol >= 1_000_000_000:
+                    stats["volume"] = f"{vol/1_000_000_000:.2f}B"
+                elif vol >= 1_000_000:
+                    stats["volume"] = f"{vol/1_000_000:.2f}M"
+                elif vol >= 1_000:
+                    stats["volume"] = f"{vol/1_000:.1f}K"
+                else:
+                    stats["volume"] = str(vol)
+
+            if price_df is not None and not price_df.empty and "Close" in price_df.columns:
+                recent = price_df["Close"].dropna().tail(20)
+                if len(recent) >= 5:
+                    sma_5 = recent.tail(5).mean()
+                    sma_20 = recent.mean()
+                    if sma_5 > sma_20:
+                        stats["signal"] = "Bullish"
+                    elif sma_5 < sma_20:
+                        stats["signal"] = "Bearish"
+                    else:
+                        stats["signal"] = "Neutral"
+        except Exception:
+            pass
+
+        return stats
+
+    def render_news_preview(news_df):
+        if news_df is None or news_df.empty:
+            st.info("No recent news available.")
+            return
+
+        preview = news_df.head(5)
+        for _, row in preview.iterrows():
+            badge = render_sentiment_badge(str(row.get("Sentiment", "Neutral")))
+            headline = str(row.get("headline", "No headline"))
+            date_val = str(row.get("date", ""))
+            time_val = str(row.get("time", ""))
+            st.markdown(
+                f'''
+                <div class="news-item">
+                    <div>{badge}</div>
+                    <div class="news-headline">{headline}</div>
+                    <div class="news-meta">{date_val} {time_val}</div>
+                </div>
+                ''',
+                unsafe_allow_html=True,
+            )
+
+    def get_news_sentiment_df(temp):
+        finwiz_url = 'https://finviz.com/quote.ashx?t='
+        news_tables = {}
+        tickers = [temp]
+
+        for ticker in tickers:
+            url = finwiz_url + ticker
+            req = Request(
+                url=url,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
+                }
+            )
+            response = urlopen(req)
+            html = BeautifulSoup(response, 'html.parser')
+            news_table = html.find(id='news-table')
+            news_tables[ticker] = news_table
+
+        parsed_news = []
+        for file_name, news_table in news_tables.items():
+            if news_table is None:
+                continue
+            for x in news_table.findAll('tr'):
+                if x.a:
+                    text = x.a.get_text()
+                else:
+                    text = "No headline available"
+
+                date_scrape = x.td.text.split()
+                date = None
+                time_val = None
+
+                if len(date_scrape) == 1:
+                    time_val = date_scrape[0]
+                else:
+                    date = date_scrape[0]
+                    time_val = date_scrape[1]
+
+                ticker_name = file_name.split('_')[0]
+                parsed_news.append([ticker_name, date, time_val, text])
+
+        vader = SentimentIntensityAnalyzer()
+        columns = ['ticker', 'date', 'time', 'headline']
+        parsed_and_scored_news = pd.DataFrame(parsed_news, columns=columns)
+
+        if parsed_and_scored_news.empty:
+            return parsed_and_scored_news
+
+        scores = parsed_and_scored_news['headline'].apply(vader.polarity_scores).tolist()
+        scores_df = pd.DataFrame(scores)
+        parsed_and_scored_news = parsed_and_scored_news.join(scores_df, rsuffix='_right')
+        parsed_and_scored_news['date'] = pd.to_datetime(parsed_and_scored_news['date'], errors='coerce').dt.date
+        parsed_and_scored_news['Sentiment'] = np.where(
+            parsed_and_scored_news['compound'] > 0,
+            'Positive',
+            np.where(parsed_and_scored_news['compound'] == 0, 'Neutral', 'Negative')
+        )
+        return parsed_and_scored_news
 
     
     #st.set_option('deprecation.showfileUploaderEncoding', False)
@@ -378,13 +527,209 @@ def main():
     result = APP_BRAND_FULL
 
     page = render_sidebar_navigation(st)
-    inject_global_css(st)
+
 
     
     
+    if page == "Dashboard":
+        render_dashboard_hero(st)
 
+        snp500 = pd.read_csv("./Datasets/SP500.csv")
+        symbols = snp500['Symbol'].sort_values().tolist()
 
-    if page == "Google Trends with Forecast":
+        top1, top2 = st.columns([2.2, 1])
+
+        with top1:
+            ticker = st.text_input(
+                "Search ticker",
+                value=st.session_state.get("global_ticker_search", "AAPL")
+            ).upper().strip()
+
+        with top2:
+            selected_ticker = st.selectbox(
+                "Or select S&P 500 ticker",
+                symbols,
+                index=symbols.index(ticker) if ticker in symbols else symbols.index("AAPL") if "AAPL" in symbols else 0
+            )
+            ticker = selected_ticker
+            st.session_state["global_ticker_search"] = ticker
+
+        try:
+            info = cached_company_info(ticker)
+            if isinstance(info, dict) and info:
+                st.session_state[f"last_info_{ticker}"] = info
+        except Exception:
+            info = st.session_state.get(f"last_info_{ticker}", {})
+
+        start = dt.datetime.today() - dt.timedelta(365 * 2)
+        end = dt.datetime.today()
+
+        price_df = safe_yf_download(ticker, start, end)
+        if price_df.empty:
+            st.error("Could not load market data.")
+            st.stop()
+
+        price_df = price_df.reset_index()
+        price_col = get_price_column(price_df)
+        if price_col is None:
+            st.error("Price column not found.")
+            st.stop()
+
+        stats = compute_quick_stats(info if isinstance(info, dict) else {}, price_df)
+
+        render_company_hero(st, ticker, info if isinstance(info, dict) else {})
+        render_metric_strip(st, info if isinstance(info, dict) else {})
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            render_insight_card(st, "Live price", stats["price"], "Latest available market price for the selected stock.")
+        with c2:
+            render_insight_card(st, "Daily move", stats["change_pct"], "Comparison against the previous close.")
+        with c3:
+            render_insight_card(st, "Volume", stats["volume"], "Reported trading volume from the latest market session.")
+        with c4:
+            render_insight_card(st, "Trend signal", stats["signal"], "Quick signal using recent short-term vs medium-term price behavior.")
+
+        left, right = st.columns([2.15, 1])
+
+        with left:
+            render_section_card_start(st, "Price performance", "Two-year price history with volume context")
+
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=price_df["Date"],
+                    y=price_df[price_col],
+                    mode="lines",
+                    name="Price",
+                    line=dict(width=3)
+                )
+            )
+
+            if "Volume" in price_df.columns:
+                fig.add_trace(
+                    go.Bar(
+                        x=price_df["Date"],
+                        y=price_df["Volume"],
+                        name="Volume",
+                        opacity=0.22,
+                        yaxis="y2"
+                    )
+                )
+
+            fig.update_layout(
+                yaxis=dict(title="Price"),
+                yaxis2=dict(
+                    title="Volume",
+                    overlaying="y",
+                    side="right",
+                    showgrid=False
+                ),
+                xaxis_rangeslider_visible=False,
+            )
+            fig = apply_plotly_dark(fig, height=460)
+            st.plotly_chart(fig, use_container_width=True)
+            render_section_card_end(st)
+
+        with right:
+            render_section_card_start(st, "Company snapshot", "Quick profile and positioning")
+            st.markdown(f"**Name:** {info.get('longName', ticker)}")
+            st.markdown(f"**Sector:** {info.get('sector', 'N/A')}")
+            st.markdown(f"**Industry:** {info.get('industry', 'N/A')}")
+            st.markdown(f"**Market cap:** {info.get('marketCap', 'N/A')}")
+            st.markdown(f"**Website:** {info.get('website', 'N/A')}")
+            st.markdown(f"**52W High:** {info.get('fiftyTwoWeekHigh', 'N/A')}")
+            st.markdown(f"**52W Low:** {info.get('fiftyTwoWeekLow', 'N/A')}")
+            render_section_card_end(st)
+
+        row2_left, row2_mid, row2_right = st.columns([1.2, 1, 1])
+
+        with row2_left:
+            render_section_card_start(st, "Technical pulse", "Short moving average view")
+            chart_df = price_df.copy()
+            chart_df["SMA_20"] = chart_df[price_col].rolling(20).mean()
+            chart_df["SMA_50"] = chart_df[price_col].rolling(50).mean()
+
+            fig_ma = go.Figure()
+            fig_ma.add_trace(go.Scatter(x=chart_df["Date"], y=chart_df[price_col], name="Price", line=dict(width=2.5)))
+            fig_ma.add_trace(go.Scatter(x=chart_df["Date"], y=chart_df["SMA_20"], name="20D SMA"))
+            fig_ma.add_trace(go.Scatter(x=chart_df["Date"], y=chart_df["SMA_50"], name="50D SMA"))
+            fig_ma = apply_plotly_dark(fig_ma, height=360)
+            st.plotly_chart(fig_ma, use_container_width=True)
+            render_section_card_end(st)
+
+        with row2_mid:
+            render_section_card_start(st, "Forecast view", "Simple forward-looking trend")
+            df_train = price_df[["Date", price_col]].copy()
+            df_train = df_train.rename(columns={"Date": "ds", price_col: "y"})
+            df_train["ds"] = pd.to_datetime(df_train["ds"], errors="coerce")
+            df_train["y"] = pd.to_numeric(df_train["y"], errors="coerce").ffill().bfill()
+
+            forecast_days = 90
+            if prophet_available and plot_plotly is not None:
+                try:
+                    m = Prophet()
+                    m.fit(df_train)
+                    future = m.make_future_dataframe(periods=forecast_days)
+                    forecast = m.predict(future)[["ds", "yhat"]]
+                except Exception:
+                    t0 = df_train["ds"].min()
+                    x = (df_train["ds"] - t0).dt.days.values.astype(float)
+                    y = df_train["y"].values.astype(float)
+                    coef = np.polyfit(x, y, 1)
+                    poly = np.poly1d(coef)
+                    future_dates = pd.date_range(df_train["ds"].max() + pd.Timedelta(days=1), periods=forecast_days, freq="D")
+                    all_ds = pd.concat([df_train["ds"].reset_index(drop=True), pd.Series(future_dates)], ignore_index=True)
+                    x_all = (pd.to_datetime(all_ds) - t0).dt.days.values.astype(float)
+                    forecast = pd.DataFrame({"ds": all_ds, "yhat": np.maximum(poly(x_all), 1e-6)})
+            else:
+                t0 = df_train["ds"].min()
+                x = (df_train["ds"] - t0).dt.days.values.astype(float)
+                y = df_train["y"].values.astype(float)
+                coef = np.polyfit(x, y, 1)
+                poly = np.poly1d(coef)
+                future_dates = pd.date_range(df_train["ds"].max() + pd.Timedelta(days=1), periods=forecast_days, freq="D")
+                all_ds = pd.concat([df_train["ds"].reset_index(drop=True), pd.Series(future_dates)], ignore_index=True)
+                x_all = (pd.to_datetime(all_ds) - t0).dt.days.values.astype(float)
+                forecast = pd.DataFrame({"ds": all_ds, "yhat": np.maximum(poly(x_all), 1e-6)})
+
+            fig_fc = go.Figure()
+            fig_fc.add_trace(go.Scatter(x=df_train["ds"], y=df_train["y"], name="Historical", line=dict(width=2.5)))
+            fig_fc.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat"], name="Forecast", line=dict(dash="dash", width=2.5)))
+            fig_fc = apply_plotly_dark(fig_fc, height=360)
+            st.plotly_chart(fig_fc, use_container_width=True)
+            render_section_card_end(st)
+
+        with row2_right:
+            render_section_card_start(st, "News sentiment", "Recent headlines and mood")
+            try:
+                news_df = get_news_sentiment_df(ticker)
+                if news_df is not None and not news_df.empty:
+                    sentiment_counts = news_df["Sentiment"].value_counts().reset_index()
+                    sentiment_counts.columns = ["Sentiment", "Count"]
+
+                    fig_sent = px.pie(
+                        sentiment_counts,
+                        values="Count",
+                        names="Sentiment",
+                        hole=0.62
+                    )
+                    fig_sent = apply_plotly_dark(fig_sent, height=260)
+                    st.plotly_chart(fig_sent, use_container_width=True)
+
+                    render_news_preview(news_df)
+                else:
+                    st.info("No news found for this ticker.")
+            except Exception:
+                st.warning("Unable to load live news right now.")
+            render_section_card_end(st)
+
+        render_section_card_start(st, "Raw data", "Detailed market table")
+        with st.expander("View market data"):
+            st.dataframe(price_df.tail(50), use_container_width=True)
+        render_section_card_end(st)
+
+    elif page == "Google Trends with Forecast":
         page_title(st, "Search trends", "Keyword interest from Google Trends with forecast")
         st.sidebar.write("""
         ## Choose a keyword and a prediction period 
@@ -423,8 +768,6 @@ def main():
             """)
             st.text('')
 
-            link = '[Project Report](https://github.com/sagarshah95/Financial-Real-Time-Stock-Analysis-using-Sentiment-Analysis-and-Time-Series-Forecasting-AWS/blob/main/README.md)'
-            st.markdown(link, unsafe_allow_html=True)
 
             st.title('AWS Data Architecture')
             st.image('./Images/Architecture Final AWS_FAST.jpg', width=900, use_container_width=True)
@@ -935,3 +1278,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
