@@ -84,6 +84,10 @@ def main():
         except Exception:
             prophet_available = False
     from pytrends.request import TrendReq
+    try:
+        from pytrends.exceptions import TooManyRequestsError
+    except ImportError:
+        TooManyRequestsError = type("TooManyRequestsError", (Exception,), {})
 
     import json
     import re
@@ -590,15 +594,97 @@ def main():
             st.error("Failed to fetch market data right now. Please try again shortly.")
             return pd.DataFrame()
 
+    def _pytrends_client():
+        try:
+            return TrendReq(
+                hl="en-US",
+                tz=360,
+                timeout=(15, 40),
+                retries=3,
+                backoff_factor=0.5,
+            )
+        except TypeError:
+            return TrendReq(hl="en-US", tz=360)
+
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def cached_google_trends_timeseries(keyword):
+        """
+        Google Trends often returns HTTP 429 for shared/cloud IPs. Cache results and
+        retry with backoff on TooManyRequestsError.
+        """
+        kw = str(keyword or "").strip() or "Amazon"
+        last_exc = None
+        max_attempts = 8
+        # Narrower windows on later attempts (smaller payloads; sometimes fewer 429s).
+        timeframes = (
+            "today 5-y",
+            "today 5-y",
+            "today 5-y",
+            "today 12-m",
+            "today 12-m",
+            "today 3-m",
+            "today 3-m",
+            "today 1-m",
+        )
+        for attempt in range(max_attempts):
+            if attempt:
+                time.sleep(min(120, 6 * (2 ** (attempt - 1))))
+            try:
+                pytrend = _pytrends_client()
+                time.sleep(1.0)
+                tf = timeframes[min(attempt, len(timeframes) - 1)]
+                pytrend.build_payload(
+                    kw_list=[kw],
+                    cat=0,
+                    timeframe=tf,
+                    geo="",
+                    gprop="",
+                )
+                time.sleep(0.35)
+                df = pytrend.interest_over_time()
+                if df is None or df.empty:
+                    raise ValueError("Google Trends returned no rows for this keyword.")
+                df = df.drop(columns=["isPartial"], errors="ignore").reset_index()
+                if df.shape[1] < 2:
+                    raise ValueError("Google Trends returned an unexpected table shape.")
+                df.columns = ["ds", "y"]
+                return df
+            except TooManyRequestsError as exc:
+                last_exc = exc
+                continue
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Google Trends request failed.")
+
     def get_data(keyword):
-        keyword = [keyword]
-        pytrend = TrendReq()
-        pytrend.build_payload(kw_list=keyword)
-        df = pytrend.interest_over_time()
-        df.drop(columns=['isPartial'], inplace=True)
-        df.reset_index(inplace=True)
-        df.columns = ["ds", "y"]
-        return df
+        """
+        Load Google Trends interest-over-time (used by Search trends and Social trends pages).
+        Persists last successful series per keyword in session_state so a 429 can still
+        show the previous chart in the same browser session.
+        """
+        kw = str(keyword or "").strip() or "Amazon"
+        sess_key = f"_pytrends_last_ok_{kw}"
+        fb_flag = f"_pytrends_used_fallback_{kw}"
+        try:
+            df = cached_google_trends_timeseries(kw)
+            st.session_state[sess_key] = df.copy()
+            st.session_state[fb_flag] = False
+            return df
+        except TooManyRequestsError:
+            prev = st.session_state.get(sess_key)
+            if isinstance(prev, pd.DataFrame) and not prev.empty:
+                st.session_state[fb_flag] = True
+                return prev.copy()
+            raise
+        except Exception as exc:
+            # Older pytrends / edge builds: ensure 429-like errors can use the same fallback.
+            if type(exc).__name__ != "TooManyRequestsError":
+                raise
+            prev = st.session_state.get(sess_key)
+            if isinstance(prev, pd.DataFrame) and not prev.empty:
+                st.session_state[fb_flag] = True
+                return prev.copy()
+            raise
 
     def make_pred_simple(df, periods):
         """
@@ -925,7 +1011,9 @@ def main():
         """)
         keyword = st.sidebar.text_input("Keyword", "Amazon")
         periods = st.sidebar.slider('Prediction time in days:', 7, 365, 90)
-        
+        st.sidebar.caption(
+            "Trends data is cached for one hour per keyword to reduce Google rate limits."
+        )
 
         # main section
         st.write("""
@@ -935,7 +1023,28 @@ def main():
         st.image('https://media.tenor.com/xfmMlSJRvdoAAAAC/google-voice-search.gif',width=350, use_container_width=True)
         st.write("Evolution of interest:", keyword)
 
-        df = get_data(keyword)
+        try:
+            df = get_data(keyword)
+        except TooManyRequestsError:
+            st.error(
+                "Google Trends is rate-limiting requests from this server (HTTP 429). "
+                "Wait several minutes and reload, try a different keyword, or run the app "
+                "from a local machine or VPN. Shared cloud IPs are throttled frequently."
+            )
+            st.stop()
+        except Exception:
+            st.error(
+                "Could not load Google Trends data right now. The service may be blocking "
+                "automated requests; try again later."
+            )
+            st.stop()
+
+        if st.session_state.get(f"_pytrends_used_fallback_{str(keyword or '').strip() or 'Amazon'}"):
+            st.info(
+                "Google rate-limited a fresh download; showing the **last successful** trend "
+                "series for this keyword in your current session."
+            )
+
         forecast, fig1, fig2 = make_pred(df, periods, show_fallback_caption=True)
 
         st.pyplot(fig1)
@@ -1020,10 +1129,31 @@ def main():
         """)
         keyword = st.sidebar.text_input("Keyword", "Amazon")
         periods = st.sidebar.slider('Prediction time in days:', 7, 365, 90)
+        st.sidebar.caption(
+            "This page uses **Google Trends** (via pytrends), not the X/Twitter API. "
+            "Data is cached one hour per keyword; shared servers often hit rate limits."
+        )
 
         st.subheader(f"Interest over time: **{keyword}**")
 
-        df = get_data(keyword)
+        try:
+            df = get_data(keyword)
+        except TooManyRequestsError:
+            st.error(
+                "Google Trends is rate-limiting requests from this server (HTTP 429). "
+                "Wait several minutes and reload, or run the app from a different network."
+            )
+            st.stop()
+        except Exception:
+            st.error("Could not load Google Trends data right now. Please try again later.")
+            st.stop()
+
+        if st.session_state.get(f"_pytrends_used_fallback_{str(keyword or '').strip() or 'Amazon'}"):
+            st.info(
+                "Google rate-limited a fresh download; showing the **last successful** trend "
+                "series for this keyword in your current session."
+            )
+
         forecast, fig1, fig2 = make_pred(df, periods, show_fallback_caption=False)
 
         st.pyplot(fig1)
