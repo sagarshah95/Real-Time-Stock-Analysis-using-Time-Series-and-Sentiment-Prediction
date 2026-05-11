@@ -83,12 +83,6 @@ def main():
             _ = Prophet()
         except Exception:
             prophet_available = False
-    from pytrends.request import TrendReq
-    try:
-        from pytrends.exceptions import TooManyRequestsError
-    except ImportError:
-        TooManyRequestsError = type("TooManyRequestsError", (Exception,), {})
-
     import json
     import re
     import textblob
@@ -317,6 +311,118 @@ def main():
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
+
+    _FINVIZ_TRENDS_ALIAS = {
+        "amazon": "AMZN",
+        "google": "GOOGL",
+        "alphabet": "GOOGL",
+        "apple": "AAPL",
+        "microsoft": "MSFT",
+        "meta": "META",
+        "facebook": "META",
+        "netflix": "NFLX",
+        "tesla": "TSLA",
+        "nvidia": "NVDA",
+        "amd": "AMD",
+        "intel": "INTC",
+        "disney": "DIS",
+        "walmart": "WMT",
+        "nike": "NKE",
+        "coca cola": "KO",
+        "coca-cola": "KO",
+        "jpmorgan": "JPM",
+        "jp morgan": "JPM",
+        "bank of america": "BAC",
+        "goldman": "GS",
+        "berkshire": "BRK-B",
+        "berkshire hathaway": "BRK-B",
+    }
+
+    def _finviz_keyword_to_ticker(keyword):
+        """Map a free-text keyword to a US equity symbol for Finviz quote/news pages."""
+        s = str(keyword or "").strip()
+        if not s:
+            return "AMZN"
+        low = s.lower()
+        if low in _FINVIZ_TRENDS_ALIAS:
+            return _FINVIZ_TRENDS_ALIAS[low]
+        compact = re.sub(r"\s+", "", s).upper()
+        if re.fullmatch(r"[A-Z.\-]{1,6}", compact):
+            return compact.replace(".", "-")
+        return compact[:6]
+
+    def _finviz_news_row_dates(news_table):
+        """Extract calendar dates from Finviz #news-table (first column; forward-fill day)."""
+        parsed = []
+        last_raw = None
+        for tr in news_table.find_all("tr"):
+            tds = tr.find_all("td")
+            if not tds:
+                continue
+            parts = tds[0].get_text(" ", strip=True).split()
+            if len(parts) >= 2:
+                raw = parts[0]
+                last_raw = raw
+            elif len(parts) == 1:
+                raw = last_raw
+            else:
+                continue
+            if not raw:
+                continue
+            low = str(raw).lower()
+            if low == "today":
+                ts = pd.Timestamp.now().normalize()
+            else:
+                ts = pd.to_datetime(raw, errors="coerce")
+            if pd.isna(ts):
+                continue
+            parsed.append(ts.normalize())
+        return parsed
+
+    def _finviz_news_activity_timeseries(news_table):
+        """
+        Daily headline counts from Finviz news timestamps, scaled to [0, 100]
+        (similar visual range to legacy Google Trends charts).
+        """
+        dates = _finviz_news_row_dates(news_table)
+        if len(dates) < 3:
+            return pd.DataFrame(columns=["ds", "y"])
+        s = pd.Series(pd.to_datetime(dates).normalize())
+        counts = s.value_counts().sort_index()
+        counts.index = pd.to_datetime(counts.index).normalize()
+        end_d = counts.index.max()
+        start_d = min(counts.index.min(), end_d - pd.Timedelta(days=150))
+        full_idx = pd.date_range(start_d, end_d, freq="D")
+        aligned = counts.reindex(full_idx.normalize(), fill_value=0.0).astype(float)
+        y = aligned.values
+        ymin, ymax = float(y.min()), float(y.max())
+        if ymax > ymin:
+            y = 100.0 * (y - ymin) / (ymax - ymin)
+        else:
+            y = np.full_like(y, 50.0, dtype=float)
+        return pd.DataFrame({"ds": full_idx, "y": y})
+
+    @st.cache_data(ttl=1800, show_spinner=False)
+    def cached_finviz_trends_proxy_series(keyword):
+        """
+        Finviz has no public Google-Trends API. We approximate 'interest' using
+        headline activity on the symbol's Finviz quote page (#news-table).
+        """
+        ticker = _finviz_keyword_to_ticker(keyword)
+        url = f"https://finviz.com/quote.ashx?t={ticker}"
+        req = Request(url, headers={"User-Agent": _FINVIZ_UA})
+        with urlopen(req, timeout=25) as resp:
+            soup = BeautifulSoup(resp.read(), "html.parser")
+        news_table = soup.find(id="news-table")
+        if news_table is None:
+            raise ValueError(f"No Finviz news table for symbol {ticker}.")
+        out = _finviz_news_activity_timeseries(news_table)
+        if out is None or out.empty or len(out) < 5:
+            raise ValueError(
+                f"Not enough Finviz news history for {ticker}. "
+                "Enter a valid US ticker (e.g. AMZN) or a supported company name."
+            )
+        return out
 
     def _finviz_snapshot_pairs(soup):
         """Parse Finviz quote snapshot label/value pairs (HTML table, not a REST API)."""
@@ -594,92 +700,20 @@ def main():
             st.error("Failed to fetch market data right now. Please try again shortly.")
             return pd.DataFrame()
 
-    def _pytrends_client():
-        try:
-            return TrendReq(
-                hl="en-US",
-                tz=360,
-                timeout=(15, 40),
-                retries=3,
-                backoff_factor=0.5,
-            )
-        except TypeError:
-            return TrendReq(hl="en-US", tz=360)
-
-    @st.cache_data(ttl=3600, show_spinner=False)
-    def cached_google_trends_timeseries(keyword):
-        """
-        Google Trends often returns HTTP 429 for shared/cloud IPs. Cache results and
-        retry with backoff on TooManyRequestsError.
-        """
-        kw = str(keyword or "").strip() or "Amazon"
-        last_exc = None
-        max_attempts = 8
-        # Narrower windows on later attempts (smaller payloads; sometimes fewer 429s).
-        timeframes = (
-            "today 5-y",
-            "today 5-y",
-            "today 5-y",
-            "today 12-m",
-            "today 12-m",
-            "today 3-m",
-            "today 3-m",
-            "today 1-m",
-        )
-        for attempt in range(max_attempts):
-            if attempt:
-                time.sleep(min(120, 6 * (2 ** (attempt - 1))))
-            try:
-                pytrend = _pytrends_client()
-                time.sleep(1.0)
-                tf = timeframes[min(attempt, len(timeframes) - 1)]
-                pytrend.build_payload(
-                    kw_list=[kw],
-                    cat=0,
-                    timeframe=tf,
-                    geo="",
-                    gprop="",
-                )
-                time.sleep(0.35)
-                df = pytrend.interest_over_time()
-                if df is None or df.empty:
-                    raise ValueError("Google Trends returned no rows for this keyword.")
-                df = df.drop(columns=["isPartial"], errors="ignore").reset_index()
-                if df.shape[1] < 2:
-                    raise ValueError("Google Trends returned an unexpected table shape.")
-                df.columns = ["ds", "y"]
-                return df
-            except TooManyRequestsError as exc:
-                last_exc = exc
-                continue
-        if last_exc is not None:
-            raise last_exc
-        raise RuntimeError("Google Trends request failed.")
-
     def get_data(keyword):
         """
-        Load Google Trends interest-over-time (used by Search trends and Social trends pages).
-        Persists last successful series per keyword in session_state so a 429 can still
-        show the previous chart in the same browser session.
+        Finviz-backed proxy for the old Google Trends series: daily news headline density
+        on the Finviz quote page for the resolved ticker, scaled to [0, 100].
         """
         kw = str(keyword or "").strip() or "Amazon"
-        sess_key = f"_pytrends_last_ok_{kw}"
-        fb_flag = f"_pytrends_used_fallback_{kw}"
+        sess_key = f"_finviz_trends_last_ok_{kw}"
+        fb_flag = f"_finviz_trends_used_fallback_{kw}"
         try:
-            df = cached_google_trends_timeseries(kw)
+            df = cached_finviz_trends_proxy_series(kw)
             st.session_state[sess_key] = df.copy()
             st.session_state[fb_flag] = False
             return df
-        except TooManyRequestsError:
-            prev = st.session_state.get(sess_key)
-            if isinstance(prev, pd.DataFrame) and not prev.empty:
-                st.session_state[fb_flag] = True
-                return prev.copy()
-            raise
-        except Exception as exc:
-            # Older pytrends / edge builds: ensure 429-like errors can use the same fallback.
-            if type(exc).__name__ != "TooManyRequestsError":
-                raise
+        except Exception:
             prev = st.session_state.get(sess_key)
             if isinstance(prev, pd.DataFrame) and not prev.empty:
                 st.session_state[fb_flag] = True
@@ -689,7 +723,7 @@ def main():
     def make_pred_simple(df, periods):
         """
         Prophet-free forecast: polynomial trend on time + simple component views.
-        Google Trends scores are clipped to [0, 100].
+        Series values are clipped to [0, 100] where applicable.
         """
         d = df.copy()
         d['ds'] = pd.to_datetime(d['ds'], errors='coerce')
@@ -1005,44 +1039,38 @@ def main():
         render_section_card_end(st)
 
     elif page == "Google Trends with Forecast":
-        page_title(st, "Search trends", "Keyword interest from Google Trends with forecast")
+        page_title(st, "Search trends", "Finviz news activity index (by ticker) with forecast")
         st.sidebar.write("""
-        ## Choose a keyword and a prediction period 
+        ## Enter a company name or stock ticker
         """)
-        keyword = st.sidebar.text_input("Keyword", "Amazon")
+        keyword = st.sidebar.text_input("Keyword or ticker", "Amazon")
         periods = st.sidebar.slider('Prediction time in days:', 7, 365, 90)
         st.sidebar.caption(
-            "Trends data is cached for one hour per keyword to reduce Google rate limits."
+            "Data comes from **Finviz** headline dates on the quote page (not Google Trends). "
+            "Results are cached ~30 minutes per keyword. Use a liquid ticker (e.g. AMZN, AAPL) for best coverage."
         )
 
         # main section
         st.write("""
-        # Welcome to Trend Predictor App
-        ### This app predicts the **Google Trend** you want!
+        # Finviz activity trend
+        ### Daily news headline density on Finviz for the resolved symbol, scaled like an interest index
         """)
         st.image('https://media.tenor.com/xfmMlSJRvdoAAAAC/google-voice-search.gif',width=350, use_container_width=True)
-        st.write("Evolution of interest:", keyword)
+        st.write("Symbol (from keyword):", keyword, "→", _finviz_keyword_to_ticker(keyword))
 
         try:
             df = get_data(keyword)
-        except TooManyRequestsError:
-            st.error(
-                "Google Trends is rate-limiting requests from this server (HTTP 429). "
-                "Wait several minutes and reload, try a different keyword, or run the app "
-                "from a local machine or VPN. Shared cloud IPs are throttled frequently."
-            )
-            st.stop()
         except Exception:
             st.error(
-                "Could not load Google Trends data right now. The service may be blocking "
-                "automated requests; try again later."
+                "Could not build a Finviz activity series. Use a valid US ticker (e.g. MSFT) or a "
+                "supported company keyword (e.g. Amazon → AMZN), then try again."
             )
             st.stop()
 
-        if st.session_state.get(f"_pytrends_used_fallback_{str(keyword or '').strip() or 'Amazon'}"):
+        if st.session_state.get(f"_finviz_trends_used_fallback_{str(keyword or '').strip() or 'Amazon'}"):
             st.info(
-                "Google rate-limited a fresh download; showing the **last successful** trend "
-                "series for this keyword in your current session."
+                "Could not refresh from Finviz; showing the **last successful** activity series "
+                "for this keyword in your current session."
             )
 
         forecast, fig1, fig2 = make_pred(df, periods, show_fallback_caption=True)
@@ -1050,7 +1078,7 @@ def main():
         st.pyplot(fig1)
             
         
-        st.write("Trends Over the Years and Months")
+        st.write("Activity over the calendar (monthly / weekday patterns)")
         st.pyplot(fig2)
 
     elif page == "About the Project":
@@ -1062,7 +1090,7 @@ def main():
             ### Our F.A.S.T application have 3 data sources for two different use cases:
             #### 1. Web Scrapping to get Live News Data
             #### 2. Twitter API to get Real time Tweets
-            #### 3. Google Trends API to get Real time Trends
+            #### 3. Finviz (quote + news) for trend-style activity charts
             """)
             st.text('')
 
@@ -1116,48 +1144,42 @@ def main():
                     st.text("Please Enter a valid Decimal value like 0.01")
 
     elif page == "Twitter Trends":
-        page_title(st, "Social trends", "Interest-over-time style chart for your keyword")
+        page_title(st, "Social trends", "Finviz news activity index (same Finviz feed as Search trends)")
         st.write("""
-        # Welcome to Twitter Sentiment App
-        ### This app predicts the **Twitter Sentiments** you want!
+        # Social / attention proxy (Finviz)
+        ### Uses **Finviz** headline timestamps for a ticker — not the X (Twitter) API
         """)
         st.image('https://assets.teenvogue.com/photos/56b4f21327a088e24b967bb6/3:2/w_531,h_354,c_limit/twitter-gifs.gif',width=350, use_container_width=True)
-        ################# Twitter API Connection #######################
         
         st.sidebar.write("""
-        ## Choose a keyword and a prediction period 
+        ## Company name or ticker, and forecast horizon
         """)
-        keyword = st.sidebar.text_input("Keyword", "Amazon")
+        keyword = st.sidebar.text_input("Keyword or ticker", "Amazon")
         periods = st.sidebar.slider('Prediction time in days:', 7, 365, 90)
         st.sidebar.caption(
-            "This page uses **Google Trends** (via pytrends), not the X/Twitter API. "
-            "Data is cached one hour per keyword; shared servers often hit rate limits."
+            "Uses **Finviz** quote-page news (not Google Trends or X). Cached ~30 minutes per keyword."
         )
 
-        st.subheader(f"Interest over time: **{keyword}**")
+        st.subheader(f"Finviz news activity: **{_finviz_keyword_to_ticker(keyword)}** (from “{keyword}”)")
 
         try:
             df = get_data(keyword)
-        except TooManyRequestsError:
+        except Exception:
             st.error(
-                "Google Trends is rate-limiting requests from this server (HTTP 429). "
-                "Wait several minutes and reload, or run the app from a different network."
+                "Could not build a Finviz activity series. Enter a valid US ticker or a supported company name."
             )
             st.stop()
-        except Exception:
-            st.error("Could not load Google Trends data right now. Please try again later.")
-            st.stop()
 
-        if st.session_state.get(f"_pytrends_used_fallback_{str(keyword or '').strip() or 'Amazon'}"):
+        if st.session_state.get(f"_finviz_trends_used_fallback_{str(keyword or '').strip() or 'Amazon'}"):
             st.info(
-                "Google rate-limited a fresh download; showing the **last successful** trend "
-                "series for this keyword in your current session."
+                "Could not refresh from Finviz; showing the **last successful** activity series "
+                "for this keyword in your current session."
             )
 
         forecast, fig1, fig2 = make_pred(df, periods, show_fallback_caption=False)
 
         st.pyplot(fig1)
-        st.write("Trends over the years and months")
+        st.write("Activity over the calendar (monthly / weekday patterns)")
         st.pyplot(fig2)
 
 
