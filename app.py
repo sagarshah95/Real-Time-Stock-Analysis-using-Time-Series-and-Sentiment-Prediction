@@ -54,7 +54,6 @@ def main():
 
 
     import time
-    import random
     import pandas as pd
     import numpy as np
     import yfinance as yf
@@ -310,29 +309,9 @@ def main():
             return 'Close'
         return None
 
-    @st.cache_data(ttl=3600, show_spinner=False)
+    @st.cache_data(ttl=300, show_spinner=False)
     def cached_company_info(sym):
-        """
-        yfinance's `.info` endpoint is rate-limited fairly easily.
-        We cache it longer and retry on rate-limit to reduce the chance
-        the UI lands on an error state.
-        """
-        sym = str(sym).strip()
-        # Retry pacing on 429s: keep the wait near "about a minute" total.
-        wait_schedule_sec = [15, 30, 60]
-        last_exc = None
-
-        for attempt in range(len(wait_schedule_sec) + 1):
-            try:
-                return yf.Ticker(sym).info
-            except YFRateLimitError as exc:
-                last_exc = exc
-                if attempt >= len(wait_schedule_sec):
-                    break
-                time.sleep(wait_schedule_sec[attempt] + random.uniform(0, 5))
-
-        # If we got here, all retries failed.
-        raise last_exc
+        return yf.Ticker(sym).info
 
     @st.cache_data(ttl=300, show_spinner=False)
     def cached_history_data(sym, start_s=None, end_s=None):
