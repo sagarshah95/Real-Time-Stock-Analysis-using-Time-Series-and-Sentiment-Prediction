@@ -309,6 +309,195 @@ def main():
             return 'Close'
         return None
 
+    _FINVIZ_UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+
+    def _finviz_snapshot_pairs(soup):
+        """Parse Finviz quote snapshot label/value pairs (HTML table, not a REST API)."""
+        pairs = []
+        for table in soup.find_all("table", class_=lambda c: c and "snapshot-table2" in c):
+            for tr in table.find_all("tr"):
+                tds = tr.find_all("td")
+                for i in range(0, len(tds) - 1, 2):
+                    label = tds[i].get_text(strip=True)
+                    if not label:
+                        continue
+                    val_td = tds[i + 1]
+                    if label.lower() == "website":
+                        a = val_td.find("a", href=True)
+                        val = (a.get("href") or "").strip() if a else val_td.get_text(" ", strip=True)
+                    else:
+                        val = val_td.get_text(" ", strip=True)
+                    pairs.append((label, val))
+        return pairs
+
+    def _finviz_parse_compact_number(text):
+        if text is None:
+            return None
+        s = str(text).strip().replace(",", "")
+        if not s or s in ("-", "N/A", "—"):
+            return None
+        mult = 1.0
+        for suf, m in (("T", 1e12), ("B", 1e9), ("M", 1e6), ("K", 1e3)):
+            if s.endswith(suf):
+                mult = m
+                s = s[: -len(suf)].strip()
+                break
+        try:
+            return float(s) * mult
+        except ValueError:
+            return None
+
+    def _finviz_parse_int_volume(text):
+        n = _finviz_parse_compact_number(text)
+        if n is None:
+            return None
+        return int(round(n))
+
+    def _finviz_parse_percent_fraction(text):
+        if not text or text in ("-", "N/A"):
+            return None
+        s = str(text).strip().replace(",", "")
+        if s.endswith("%"):
+            try:
+                return float(s[:-1].strip()) / 100.0
+            except ValueError:
+                return None
+        return None
+
+    def _finviz_eps_next_year_estimate(pairs):
+        for lab, val in pairs:
+            if lab == "EPS next Y" and val and "%" not in val:
+                try:
+                    return float(str(val).strip().replace(",", ""))
+                except ValueError:
+                    continue
+        return None
+
+    def _finviz_forward_dividend_parts(text):
+        if not text:
+            return None, None
+        m = re.search(r"([\d.]+)\s*\(([\d.]+)%\)", str(text))
+        if not m:
+            return None, _finviz_parse_percent_fraction(text)
+        try:
+            rate = float(m.group(1))
+            yld = float(m.group(2)) / 100.0
+            return rate, yld
+        except ValueError:
+            return None, None
+
+    def _finviz_build_company_info(ticker, soup):
+        pairs = _finviz_snapshot_pairs(soup)
+        if not pairs:
+            raise ValueError("Finviz quote page contained no snapshot table data.")
+
+        mp = {}
+        for lab, val in pairs:
+            mp[lab] = val
+
+        title_name = None
+        if soup.title and soup.title.string and " - " in soup.title.string:
+            title_name = soup.title.string.split(" - ", 1)[1].split(" Stock")[0].strip()
+
+        og = soup.find("meta", attrs={"property": "og:description"})
+        og_desc = (og.get("content") or "").strip() if og else ""
+
+        price = _finviz_parse_compact_number(mp.get("Price"))
+        prev_close = _finviz_parse_compact_number(mp.get("Prev Close"))
+        vol = _finviz_parse_int_volume(mp.get("Volume"))
+        avg_vol = _finviz_parse_compact_number(mp.get("Avg Volume"))
+        mcap = _finviz_parse_compact_number(mp.get("Market Cap"))
+        ev = _finviz_parse_compact_number(mp.get("Enterprise Value"))
+        income = _finviz_parse_compact_number(mp.get("Income"))
+        beta = _finviz_parse_compact_number(mp.get("Beta"))
+        trailing_pe = _finviz_parse_compact_number(mp.get("P/E"))
+        forward_pe = _finviz_parse_compact_number(mp.get("Forward P/E"))
+        peg = _finviz_parse_compact_number(mp.get("PEG"))
+        pb = _finviz_parse_compact_number(mp.get("P/B"))
+        book_sh = _finviz_parse_compact_number(mp.get("Book/sh"))
+        eps_fwd = _finviz_eps_next_year_estimate(pairs)
+        div_rate, div_yield = _finviz_forward_dividend_parts(mp.get("Forward Dividend & Yield", ""))
+        if div_yield is None:
+            div_yield = _finviz_parse_percent_fraction(mp.get("Dividend %"))
+
+        profit_margin = _finviz_parse_percent_fraction(mp.get("Profit Margin"))
+        payout = _finviz_parse_percent_fraction(mp.get("Payout"))
+        ev_sales = _finviz_parse_compact_number(mp.get("EV/Sales"))
+        ev_ebitda = _finviz_parse_compact_number(mp.get("EV/EBITDA"))
+        sh_out = _finviz_parse_compact_number(mp.get("Shs Outstand"))
+        sh_float = _finviz_parse_compact_number(mp.get("Shs Float"))
+        short_ratio = _finviz_parse_compact_number(mp.get("Short Ratio"))
+        short_interest = _finviz_parse_compact_number(mp.get("Short Interest"))
+
+        summary = og_desc or (
+            f"{title_name or ticker} — snapshot fundamentals from Finviz "
+            f"(sector: {mp.get('Sector', 'N/A')}, industry: {mp.get('Industry', 'N/A')})."
+        )
+
+        info = {
+            "longName": title_name or mp.get("Company", ticker),
+            "shortName": title_name or ticker,
+            "symbol": ticker,
+            "regularMarketPrice": price,
+            "currentPrice": price,
+            "previousClose": prev_close,
+            "currency": "USD",
+            "volume": vol,
+            "averageVolume": int(avg_vol) if avg_vol is not None else None,
+            "marketCap": int(mcap) if mcap is not None else None,
+            "enterpriseValue": int(ev) if ev is not None else None,
+            "trailingPE": trailing_pe,
+            "forwardPE": forward_pe,
+            "pegRatio": peg,
+            "priceToBook": pb,
+            "forwardEps": eps_fwd,
+            "beta": beta,
+            "bookValue": book_sh,
+            "dividendRate": div_rate,
+            "dividendYield": div_yield,
+            "fiveYearAvgDividendYield": None,
+            "payoutRatio": payout,
+            "profitMargins": profit_margin,
+            "enterpriseToRevenue": ev_sales,
+            "enterpriseToEbitda": ev_ebitda,
+            "netIncomeToCommon": int(income) if income is not None else None,
+            "sector": mp.get("Sector", "N/A"),
+            "industry": mp.get("Industry", "N/A"),
+            "country": mp.get("Country", "N/A"),
+            "exchange": mp.get("Exchange", "N/A"),
+            "quoteType": "EQUITY",
+            "market": mp.get("Exchange", "N/A"),
+            "website": mp.get("Website", "N/A"),
+            "phone": "N/A",
+            "address1": "N/A",
+            "city": "N/A",
+            "zip": "N/A",
+            "longBusinessSummary": summary,
+            "sharesOutstanding": int(sh_out) if sh_out is not None else None,
+            "floatShares": int(sh_float) if sh_float is not None else None,
+            "sharesShort": int(short_interest) if short_interest is not None else None,
+            "shortRatio": short_ratio,
+            "bidSize": "N/A",
+            "askSize": "N/A",
+            "fullTimeEmployees": _finviz_parse_int_volume(mp.get("Employees")),
+        }
+        return info
+
+    @st.cache_data(ttl=900, show_spinner=False)
+    def cached_finviz_company_info(sym):
+        sym = str(sym).strip().upper()
+        if not sym:
+            return {}
+        url = f"https://finviz.com/quote.ashx?t={sym}"
+        req = Request(url, headers={"User-Agent": _FINVIZ_UA})
+        with urlopen(req, timeout=25) as resp:
+            html = resp.read()
+        soup = BeautifulSoup(html, "html.parser")
+        return _finviz_build_company_info(sym, soup)
+
     @st.cache_data(ttl=300, show_spinner=False)
     def cached_company_info(sym):
         return yf.Ticker(sym).info
@@ -1168,23 +1357,20 @@ def main():
             symbols)
 
         try:
-            info = cached_company_info(ticker)
+            info = cached_finviz_company_info(ticker)
             if isinstance(info, dict) and info:
                 st.session_state[f"last_info_{ticker}"] = info
-        except YFRateLimitError:
-            info = st.session_state.get(f"last_info_{ticker}", {})
-            if info:
-                st.info("Yahoo rate limited. Showing cached company details.")
-            else:
-                st.error("Yahoo Finance rate limit reached. Please wait a minute and try again.")
-                st.stop()
         except Exception:
             info = st.session_state.get(f"last_info_{ticker}", {})
             if info:
-                st.info("Unable to refresh company details. Showing cached data.")
+                st.info("Unable to refresh from Finviz. Showing cached company details.")
             else:
-                st.error("Unable to fetch company details right now. Please try again shortly.")
+                st.error(
+                    "Unable to load company profile from Finviz right now "
+                    "(network block, ticker not found, or page layout changed). Please try again later."
+                )
                 st.stop()
+        st.caption("Company profile metrics are sourced from Finviz public quote pages (HTML snapshot), not Yahoo Finance `.info`.")
         page_title(st, "Company profile", "Fundamentals, narrative, and price history")
         col_cb, col_cb_rail = st.columns([2.4, 1])
         with col_cb:
