@@ -53,7 +53,6 @@ def main():
     from os.path import isfile, join
 
 
-    import random
     import time
     import pandas as pd
     import numpy as np
@@ -310,36 +309,31 @@ def main():
             return 'Close'
         return None
 
-    @st.cache_data(ttl=3600, show_spinner=False)
+    @st.cache_data(ttl=300, show_spinner=False)
     def cached_company_info(sym):
-        return _yf_retry(lambda: yf.Ticker(sym).info)
+        return yf.Ticker(sym).info
 
-    @st.cache_data(ttl=900, show_spinner=False)
+    @st.cache_data(ttl=300, show_spinner=False)
     def cached_history_data(sym, start_s=None, end_s=None):
-        def _fetch():
-            return yf.Ticker(sym).history(
-                start=start_s,
-                end=end_s,
-                interval='1d',
-                auto_adjust=False,
-                actions=False,
-            )
+        t = yf.Ticker(sym)
+        hist = t.history(
+            start=start_s,
+            end=end_s,
+            interval='1d',
+            auto_adjust=False,
+            actions=False,
+        )
+        return hist
 
-        return _yf_retry(_fetch)
-
-    @st.cache_data(ttl=900, show_spinner=False)
+    @st.cache_data(ttl=300, show_spinner=False)
     def cached_download_data(sym, start_s=None, end_s=None):
-        def _fetch():
-            return yf.download(
-                sym,
-                start=start_s,
-                end=end_s,
-                auto_adjust=False,
-                progress=False,
-                threads=False,
-            )
-
-        return _yf_retry(_fetch)
+        return yf.download(
+            sym,
+            start=start_s,
+            end=end_s,
+            auto_adjust=False,
+            progress=False,
+        )
 
     def _ohlcv_from_history(sym, start=None, end=None, ticker=None):
         """Single-symbol OHLCV via Ticker.history — usually more reliable than download()."""
@@ -358,28 +352,6 @@ def main():
                 if str(first).lower() in ('date', 'datetime', 'index') or pd.api.types.is_datetime64_any_dtype(out[first]):
                     out = out.rename(columns={first: 'Date'})
         return normalize_market_df(out)
-
-    def _yf_global_throttle(min_interval_sec=1.25):
-        """Space out Yahoo requests in one browser session to reduce 429 bursts."""
-        key = "_yf_last_call_ts"
-        now = time.monotonic()
-        last = float(st.session_state.get(key, 0.0))
-        wait = last + min_interval_sec - now
-        if wait > 0:
-            time.sleep(wait)
-        st.session_state[key] = time.monotonic()
-
-    def _yf_retry(operation, max_attempts=5, base_sleep_sec=3.0):
-        """Retry Yahoo Finance calls on rate limit with exponential backoff."""
-        for attempt in range(max_attempts):
-            _yf_global_throttle()
-            try:
-                return operation()
-            except YFRateLimitError:
-                if attempt >= max_attempts - 1:
-                    raise
-                delay = base_sleep_sec * (2**attempt) + random.uniform(0, 1.5)
-                time.sleep(delay)
 
     def safe_yf_download(ticker, start=None, end=None, ticker_obj=None):
         sym = str(ticker).strip()
