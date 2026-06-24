@@ -1,4 +1,4 @@
-"""AI Analyst UI — uses backend.client (direct mode by default)."""
+"""AI Analyst UI module (not a Streamlit multipage file — see views/ not pages/)."""
 
 from __future__ import annotations
 
@@ -7,22 +7,46 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+# Ensure project root is on sys.path when Streamlit loads this module
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import requests
 import streamlit as st
 
-from backend.client import (
-    analyze_ticker,
-    chat_message,
-    ingest_rag_corpus,
-    rag_health_status,
-    rag_search,
-    runtime_mode_label,
-    should_use_remote_api,
-)
 from config.settings import get_settings
+
+
+def _api_available() -> bool:
+    settings = get_settings()
+    url = f"{settings.api_url.rstrip('/')}/health"
+    try:
+        resp = requests.get(url, timeout=3)
+        return resp.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def _api_request(method: str, path: str, **kwargs) -> dict[str, Any]:
+    settings = get_settings()
+    url = f"{settings.api_url.rstrip('/')}{path}"
+    try:
+        resp = requests.request(method, url, timeout=120, **kwargs)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.ConnectionError:
+        return {"error": "API unavailable. Start the backend: uvicorn api.main:app --port 8000"}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _local_chat(message: str, ticker: str) -> dict[str, Any]:
+    from agents.orchestrator import get_agent
+
+    agent = get_agent()
+    history = st.session_state.get("ai_chat_history", [])
+    return agent.chat(message, ticker=ticker or None, history=history[-10:])
 
 
 def render_ai_analyst_page(st_module, page_title_fn, render_section_card_start, render_section_card_end):
@@ -32,11 +56,27 @@ def render_ai_analyst_page(st_module, page_title_fn, render_section_card_start, 
 
     settings = get_settings()
 
-    ticker = st.text_input(
-        "Focus ticker",
-        value=st.session_state.get("global_ticker_search", "AAPL"),
-    ).upper().strip()
-    st.session_state["global_ticker_search"] = ticker
+    cfg_left, cfg_right = st.columns([1, 1])
+    with cfg_left:
+        use_api_toggle = st.toggle(
+            "Use FastAPI backend",
+            value=False,
+            help="Route requests through the REST API (requires uvicorn on port 8000)",
+        )
+    with cfg_right:
+        ticker = st.text_input(
+            "Focus ticker",
+            value=st.session_state.get("global_ticker_search", "AAPL"),
+        ).upper().strip()
+        st.session_state["global_ticker_search"] = ticker
+
+    use_api = use_api_toggle and _api_available()
+    if use_api_toggle and not use_api:
+        st.info(
+            "FastAPI backend is not running — using **direct mode**. "
+            "To enable the API, run in a separate terminal: "
+            "`python -m uvicorn api.main:app --port 8000` or double-click `start_api.bat`."
+        )
 
     tab_chat, tab_analyze, tab_rag, tab_setup = st.tabs(
         ["Chat", "Full Analysis", "RAG Search", "Setup"]
@@ -59,8 +99,13 @@ def render_ai_analyst_page(st_module, page_title_fn, render_section_card_start, 
         prompt = st.chat_input(f"Ask about {ticker} or any stock...")
         if prompt:
             try:
-                history = st.session_state.get("ai_chat_history", [])
-                result = chat_message(prompt, ticker=ticker, history=history[-10:])
+                if use_api:
+                    result = _api_request(
+                        "POST", "/chat",
+                        json={"message": prompt, "ticker": ticker},
+                    )
+                else:
+                    result = _local_chat(prompt, ticker)
 
                 if "error" in result:
                     response_text = f"**Error:** {result['error']}"
@@ -95,7 +140,11 @@ def render_ai_analyst_page(st_module, page_title_fn, render_section_card_start, 
         if st.button(f"Analyze {ticker}", type="primary", key="ai_analyze_btn"):
             try:
                 with st.spinner(f"Running full analysis on {ticker}..."):
-                    result = analyze_ticker(ticker)
+                    if use_api:
+                        result = _api_request("POST", "/analyze", json={"ticker": ticker})
+                    else:
+                        from agents.orchestrator import get_agent
+                        result = get_agent().analyze(ticker)
                 st.session_state["ai_last_analysis"] = result
             except Exception as exc:
                 st.error(f"Analysis failed: {exc}")
@@ -120,7 +169,16 @@ def render_ai_analyst_page(st_module, page_title_fn, render_section_card_start, 
         if st.button("Search transcripts", key="ai_rag_search"):
             try:
                 with st.spinner("Searching..."):
-                    result = rag_search(rag_query, ticker=rag_ticker or None)
+                    if use_api:
+                        result = _api_request(
+                            "POST", "/rag/query",
+                            json={"query": rag_query, "ticker": rag_ticker or None},
+                        )
+                    else:
+                        from rag.retriever import get_retriever
+                        retriever = get_retriever()
+                        result = retriever.query_with_context(rag_query, rag_ticker or None)
+                        result["chunks"] = retriever.retrieve(rag_query, rag_ticker or None)
                 st.session_state["ai_rag_results"] = result
             except Exception as exc:
                 st.error(f"RAG search failed: {exc}")
@@ -141,60 +199,48 @@ def render_ai_analyst_page(st_module, page_title_fn, render_section_card_start, 
         render_section_card_end(st)
 
     with tab_setup:
-        render_section_card_start(st, "Setup & Configuration", "RAG indexing and runtime mode")
-        st.caption(f"Runtime: **{runtime_mode_label()}**")
-
-        if should_use_remote_api():
-            st.info(
-                "Remote API mode is enabled (`USE_API=true`). "
-                "Ensure `API_URL` points to your deployed FastAPI service."
-            )
-        else:
-            st.markdown("""
-            ### Quick start (direct mode — recommended for Streamlit Cloud)
-            1. Use **Chat** or **Full Analysis** tabs
-            2. If RAG corpus is empty, click **Index RAG corpus** below
-            3. Set secrets in Streamlit Cloud or `.env` locally (`LLM_PROVIDER`, API keys, `HF_TOKEN`)
-            """)
+        render_section_card_start(st, "Setup & Configuration", "RAG indexing, API, and MCP")
+        st.markdown("""
+        ### Quick start
+        1. Use **Chat** tab (leave "Use FastAPI backend" off for direct mode)
+        2. If RAG docs = 0, click **Index RAG corpus** below
+        3. Set `LLM_PROVIDER` and `HF_TOKEN` in `.env`
+        """)
 
         hf_status = "configured" if settings.hf_token_configured else "not set"
         st.caption(f"Hugging Face Hub token: {hf_status}")
 
         try:
-            health = rag_health_status()
-            if health.get("error"):
-                with st.expander("RAG setup issue", expanded=False):
-                    st.error(str(health["error"]))
-            else:
-                rag_count = health.get("document_count", 0)
-                st.caption(f"RAG corpus: {rag_count} document chunks indexed")
+            from rag.retriever import rag_health
+            rag_count = rag_health().get("document_count", 0)
+            st.caption(f"RAG corpus: {rag_count} document chunks indexed")
         except Exception as exc:
             with st.expander("RAG setup issue", expanded=False):
                 st.error(str(exc))
+                st.caption(
+                    "If this mentions protobuf, restart the app after `pip install -r requirements.txt`."
+                )
 
         if st.button("Index RAG corpus (all transcripts)", key="ai_rag_ingest"):
             try:
                 with st.spinner("Indexing transcripts..."):
-                    details = ingest_rag_corpus()
-                if isinstance(details, dict) and details.get("error"):
-                    st.error(details["error"])
-                else:
-                    st.success(
-                        f"Indexed {details.get('indexed_files', 0)} files, "
-                        f"{details.get('total_chunks', 0)} chunks"
-                    )
+                    if use_api:
+                        result = _api_request("POST", "/rag/ingest")
+                        details = result.get("details", result)
+                    else:
+                        from rag.ingest import ingest_transcripts
+                        details = ingest_transcripts()
+                st.success(
+                    f"Indexed {details.get('indexed_files', 0)} files, "
+                    f"{details.get('total_chunks', 0)} chunks"
+                )
             except Exception as exc:
                 st.error(str(exc))
 
-        st.code("""# Streamlit Cloud secrets (.streamlit/secrets.toml) — direct mode
-USE_API = false
-LLM_PROVIDER = "groq"
-GROQ_API_KEY = "gsk_..."
-HF_TOKEN = "hf_..."
-
-# Optional: remote FastAPI (Render / Railway / etc.)
-# USE_API = true
-# API_URL = "https://your-fastapi.onrender.com"
-""", language="toml")
+        st.code("""# .env
+LLM_PROVIDER=groq
+GROQ_API_KEY=gsk_...
+HF_TOKEN=hf_...
+OPENAI_API_KEY=sk-...""", language="bash")
 
         render_section_card_end(st)
