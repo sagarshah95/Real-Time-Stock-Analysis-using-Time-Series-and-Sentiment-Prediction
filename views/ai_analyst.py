@@ -18,6 +18,16 @@ import streamlit as st
 from config.settings import get_settings
 
 
+def _api_available() -> bool:
+    settings = get_settings()
+    url = f"{settings.api_url.rstrip('/')}/health"
+    try:
+        resp = requests.get(url, timeout=3)
+        return resp.status_code == 200
+    except requests.RequestException:
+        return False
+
+
 def _api_request(method: str, path: str, **kwargs) -> dict[str, Any]:
     settings = get_settings()
     url = f"{settings.api_url.rstrip('/')}{path}"
@@ -48,7 +58,11 @@ def render_ai_analyst_page(st_module, page_title_fn, render_section_card_start, 
 
     cfg_left, cfg_right = st.columns([1, 1])
     with cfg_left:
-        use_api = st.toggle("Use FastAPI backend", value=False, help="Route requests through the REST API")
+        use_api_toggle = st.toggle(
+            "Use FastAPI backend",
+            value=False,
+            help="Route requests through the REST API (requires uvicorn on port 8000)",
+        )
     with cfg_right:
         ticker = st.text_input(
             "Focus ticker",
@@ -56,10 +70,13 @@ def render_ai_analyst_page(st_module, page_title_fn, render_section_card_start, 
         ).upper().strip()
         st.session_state["global_ticker_search"] = ticker
 
-    if use_api:
-        health = _api_request("GET", "/health")
-        if "error" in health:
-            st.warning(health["error"])
+    use_api = use_api_toggle and _api_available()
+    if use_api_toggle and not use_api:
+        st.info(
+            "FastAPI backend is not running — using **direct mode**. "
+            "To enable the API, run in a separate terminal: "
+            "`python -m uvicorn api.main:app --port 8000` or double-click `start_api.bat`."
+        )
 
     tab_chat, tab_analyze, tab_rag, tab_setup = st.tabs(
         ["Chat", "Full Analysis", "RAG Search", "Setup"]
