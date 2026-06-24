@@ -32,10 +32,10 @@ from api.models import (
     RAGQueryRequest,
     RAGQueryResponse,
 )
-from agents.orchestrator import get_agent
+from backend.agent_pipeline import run_analysis, run_chat
+from backend.rag_pipeline import ingest_corpus, run_query
 from config.settings import get_settings
-from rag.ingest import ingest_all
-from rag.retriever import get_retriever, rag_health
+from rag.retriever import rag_health
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,8 +53,8 @@ async def lifespan(app: FastAPI):
         stats = rag_health()
         if stats.get("document_count", 0) == 0:
             logger.info("RAG corpus empty — auto-indexing transcripts...")
-            result = ingest_all()
-            logger.info("RAG indexed: %s", result.get("transcripts", {}))
+            result = ingest_corpus()
+            logger.info("RAG indexed: %s", result)
     except Exception as exc:
         logger.warning("RAG auto-ingest skipped: %s", exc)
 
@@ -93,9 +93,8 @@ async def health():
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     try:
-        agent = get_agent()
-        result = agent.chat(
-            message=request.message,
+        result = run_chat(
+            request.message,
             ticker=request.ticker,
             history=request.history,
         )
@@ -108,8 +107,7 @@ async def chat(request: ChatRequest):
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(request: AnalyzeRequest):
     try:
-        agent = get_agent()
-        result = agent.analyze(request.ticker.upper())
+        result = run_analysis(request.ticker.upper())
         return AnalyzeResponse(
             ticker=result.get("ticker", request.ticker.upper()),
             mode=result.get("mode", "unknown"),
@@ -127,16 +125,12 @@ async def analyze(request: AnalyzeRequest):
 @app.post("/rag/query", response_model=RAGQueryResponse)
 async def rag_query(request: RAGQueryRequest):
     try:
-        retriever = get_retriever()
-        result = retriever.query_with_context(
-            request.query,
-            ticker=request.ticker.upper() if request.ticker else None,
-        )
-        chunks = retriever.retrieve(
+        result = run_query(
             request.query,
             ticker=request.ticker.upper() if request.ticker else None,
             top_k=request.top_k,
         )
+        chunks = result.get("chunks", [])
         return RAGQueryResponse(
             query=request.query,
             ticker=request.ticker,
@@ -152,7 +146,7 @@ async def rag_query(request: RAGQueryRequest):
 @app.post("/rag/ingest", response_model=IngestResponse)
 async def rag_ingest():
     try:
-        result = ingest_all()
+        result = ingest_corpus()
         return IngestResponse(status="ok", details=result)
     except Exception as exc:
         logger.exception("RAG ingest failed")

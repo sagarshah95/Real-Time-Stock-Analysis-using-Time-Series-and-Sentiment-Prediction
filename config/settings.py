@@ -79,10 +79,11 @@ class Settings(BaseSettings):
         alias="SP500_CSV",
     )
 
-    # API
+    # API — direct mode by default (Streamlit Cloud). Set USE_API=true + public API_URL for remote FastAPI.
+    use_api: bool = Field(default=False, alias="USE_API")
     api_host: str = Field(default="0.0.0.0", alias="API_HOST")
     api_port: int = Field(default=8000, alias="API_PORT")
-    api_url: str = Field(default="http://localhost:8000", alias="API_URL")
+    api_url: str = Field(default="", alias="API_URL")
 
     # MCP
     mcp_host: str = Field(default="0.0.0.0", alias="MCP_HOST")
@@ -194,6 +195,16 @@ class Settings(BaseSettings):
         return bool(self.hf_token.strip())
 
     @property
+    def resolved_api_url(self) -> str:
+        """API base URL; falls back to localhost only for local FastAPI dev."""
+        explicit = self.api_url.strip()
+        if explicit:
+            return explicit.rstrip("/")
+        if self.use_api:
+            return f"http://localhost:{self.api_port}"
+        return ""
+
+    @property
     def inference_data_path(self) -> Path:
         from config.paths import transcripts_dir
         return transcripts_dir(self.inference_data_dir)
@@ -223,7 +234,9 @@ def apply_hf_hub_token(token: str = "", *, force: bool = False) -> None:
 @lru_cache
 def get_settings() -> Settings:
     from config.bootstrap import apply_settings_env
+    from config.streamlit_env import apply_streamlit_secrets
 
+    apply_streamlit_secrets()
     settings = Settings()
     apply_hf_hub_token(settings.hf_token)
     apply_settings_env(settings)
