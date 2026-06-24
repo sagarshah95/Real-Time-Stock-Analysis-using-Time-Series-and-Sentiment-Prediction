@@ -46,41 +46,20 @@ def render_ai_analyst_page(st_module, page_title_fn, render_section_card_start, 
 
     settings = get_settings()
 
-    col_cfg, col_status = st.columns([2, 1])
-    with col_cfg:
+    cfg_left, cfg_right = st.columns([1, 1])
+    with cfg_left:
         use_api = st.toggle("Use FastAPI backend", value=False, help="Route requests through the REST API")
+    with cfg_right:
         ticker = st.text_input(
             "Focus ticker",
             value=st.session_state.get("global_ticker_search", "AAPL"),
         ).upper().strip()
         st.session_state["global_ticker_search"] = ticker
 
-    with col_status:
-        if use_api:
-            health = _api_request("GET", "/health")
-            if "error" in health:
-                st.warning(health["error"])
-            else:
-                llm_ok = health.get("llm_configured", False)
-                rag_count = health.get("rag", {}).get("document_count", 0)
-                provider = health.get("llm_provider", "")
-                model = health.get("llm_model", "")
-                st.metric("LLM", f"{provider} / {model}" if llm_ok else "Fallback mode")
-                st.metric("RAG docs", rag_count)
-        else:
-            provider = settings.active_provider
-            model = settings.resolved_model
-            st.metric("LLM", f"{provider} / {model}" if settings.llm_configured else "Fallback mode")
-            try:
-                from rag.retriever import rag_health
-                st.metric("RAG docs", rag_health().get("document_count", 0))
-            except Exception as exc:
-                st.metric("RAG docs", "—")
-                with st.expander("RAG setup issue", expanded=False):
-                    st.error(str(exc))
-                    st.caption(
-                        "If this mentions protobuf, restart the app after `pip install -r requirements.txt`."
-                    )
+    if use_api:
+        health = _api_request("GET", "/health")
+        if "error" in health:
+            st.warning(health["error"])
 
     tab_chat, tab_analyze, tab_rag, tab_setup = st.tabs(
         ["Chat", "Full Analysis", "RAG Search", "Setup"]
@@ -213,6 +192,17 @@ def render_ai_analyst_page(st_module, page_title_fn, render_section_card_start, 
 
         hf_status = "configured" if settings.hf_token_configured else "not set"
         st.caption(f"Hugging Face Hub token: {hf_status}")
+
+        try:
+            from rag.retriever import rag_health
+            rag_count = rag_health().get("document_count", 0)
+            st.caption(f"RAG corpus: {rag_count} document chunks indexed")
+        except Exception as exc:
+            with st.expander("RAG setup issue", expanded=False):
+                st.error(str(exc))
+                st.caption(
+                    "If this mentions protobuf, restart the app after `pip install -r requirements.txt`."
+                )
 
         if st.button("Index RAG corpus (all transcripts)", key="ai_rag_ingest"):
             try:
