@@ -1,5 +1,10 @@
 import subprocess
 import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 # data_dir2 = '/root/Assignment4/Assignment-Trial/Assignment-Trial/fastAPIandStreamlit/awsdownload/'
 
 
@@ -22,7 +27,7 @@ def main():
 
     import streamlit as st
 
-    from ui_theme import (
+    from ui.theme import (
         APP_BRAND_FULL,
         init_theme_state,
         inject_global_css,
@@ -32,6 +37,7 @@ def main():
         render_company_hero,
         render_metric_strip,
         render_dashboard_hero,
+        render_page_hero,
         render_section_card_start,
         render_section_card_end,
         render_insight_card,
@@ -66,6 +72,18 @@ def main():
     from datetime import date
 
     import matplotlib.pyplot as plt
+
+    from config.settings import get_settings
+    from config.paths import architecture_image_path
+
+    _app_settings = get_settings()
+    _transcripts_dir = str(_app_settings.inference_data_path)
+    if not _transcripts_dir.endswith(("/", "\\")):
+        _transcripts_dir += "/"
+    _sp500_csv = str(_app_settings.sp500_path)
+    _arch_image = architecture_image_path()
+    from services.indicators import compute_rsi, compute_bollinger_bands
+    from services.technicals import get_technicals_summary
 
     try:
         from prophet import Prophet
@@ -108,12 +126,16 @@ def main():
     #from transformers import pipeline as summarize
 
     def apply_plotly_dark(fig, height=420):
+        is_light = st.session_state.get("ui_theme_is_light", True)
+        template = "plotly_white" if is_light else "plotly_dark"
+        grid = "rgba(30,41,59,0.08)" if is_light else "rgba(255,255,255,0.08)"
         fig.update_layout(
-            template="plotly_dark",
+            template=template,
             height=height,
             margin=dict(l=20, r=20, t=40, b=20),
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#1E293B" if is_light else "#E8EEF5"),
             legend=dict(
                 orientation="h",
                 yanchor="bottom",
@@ -122,8 +144,8 @@ def main():
                 x=0
             ),
         )
-        fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.08)")
-        fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.08)")
+        fig.update_xaxes(showgrid=True, gridcolor=grid)
+        fig.update_yaxes(showgrid=True, gridcolor=grid)
         return fig
 
     def compute_quick_stats(info, price_df):
@@ -255,7 +277,7 @@ def main():
     #st.set_option('deprecation.showfileUploaderEncoding', False)
     #st.set_option('deprecation.showPyplotGlobalUse', False)
 
-    data_dir = './inference-data/'
+    data_dir = _transcripts_dir
 
      
     #page = st.sidebar.radio("Choose a page", ["Homepage", "SignUp"])
@@ -423,6 +445,55 @@ def main():
                 "Enter a valid US ticker (e.g. AMZN) or a supported company name."
             )
         return out
+
+    @st.cache_data(ttl=1800, show_spinner=False)
+    def cached_google_trends_news_series(keyword):
+        """Google Trends news/web search interest for keyword/ticker."""
+        from services.google_trends import fetch_google_trends_news_interest
+        df, query, source = fetch_google_trends_news_interest(keyword)
+        return df, query, source
+
+    def get_search_trends_data(keyword):
+        """
+        Google Trends interest for the stock/company keyword, with Finviz fallback.
+        """
+        kw = str(keyword or "").strip() or "Amazon"
+        sess_key = f"_google_trends_last_ok_{kw}"
+        fb_flag = f"_google_trends_used_fallback_{kw}"
+        query_key = f"_google_trends_query_{kw}"
+        source_key = f"_google_trends_source_{kw}"
+        reason_key = f"_google_trends_fallback_reason_{kw}"
+
+        def _store(df, query, source, used_fallback=False, reason=""):
+            st.session_state[sess_key] = df.copy()
+            st.session_state[query_key] = query
+            st.session_state[source_key] = source
+            st.session_state[fb_flag] = used_fallback
+            st.session_state[reason_key] = reason
+            return df
+
+        try:
+            df, query, source = cached_google_trends_news_series(kw)
+            return _store(df, query, source, used_fallback=False)
+        except Exception as gt_err:
+            prev = st.session_state.get(sess_key)
+            if isinstance(prev, pd.DataFrame) and not prev.empty:
+                st.session_state[fb_flag] = True
+                st.session_state[reason_key] = str(gt_err)
+                return prev.copy()
+
+            try:
+                ticker = _finviz_keyword_to_ticker(kw)
+                df = cached_finviz_trends_proxy_series(kw)
+                return _store(
+                    df,
+                    f"{ticker} (Finviz headlines)",
+                    "Finviz news activity (fallback)",
+                    used_fallback=True,
+                    reason=str(gt_err),
+                )
+            except Exception:
+                raise gt_err
 
     def _finviz_snapshot_pairs(soup):
         """Parse Finviz quote snapshot label/value pairs (HTML table, not a REST API)."""
@@ -794,44 +865,6 @@ def main():
             st.caption('Using built-in trend forecast (Prophet is not installed or not usable on this machine).')
         return make_pred_simple(df, periods)
 
-    def _stock_forecast_fallback(df_train, period_days, n_years):
-        d = df_train.dropna(subset=['ds', 'y']).copy()
-        if len(d) < 5:
-            st.error('Not enough price history to forecast.')
-            st.stop()
-        t0 = d['ds'].min()
-        x = (d['ds'] - t0).dt.days.values.astype(float)
-        y = d['y'].values.astype(float)
-        coef = np.polyfit(x, y, 1)
-        poly = np.poly1d(coef)
-        last = d['ds'].max()
-        future = pd.date_range(last + pd.Timedelta(days=1), periods=int(period_days), freq='D')
-        all_ds = pd.concat([d['ds'].reset_index(drop=True), pd.Series(future)], ignore_index=True)
-        x_all = (pd.to_datetime(all_ds) - t0).dt.days.values.astype(float)
-        yhat = np.maximum(poly(x_all), 1e-6)
-        forecast = pd.DataFrame({'ds': pd.to_datetime(all_ds), 'yhat': yhat})
-        st.subheader('Forecast data')
-        st.write(forecast.tail())
-        st.write(f'Forecast plot for {n_years} years (linear trend)')
-        figp = go.Figure()
-        figp.add_trace(go.Scatter(x=d['ds'], y=d['y'], name='Close (historical)'))
-        figp.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat'], name='Forecast', line=dict(dash='dash')))
-        figp.update_layout(title_text='Price and linear trend forecast')
-        st.plotly_chart(figp, use_container_width=True)
-        st.write('Forecast components (approx.)')
-        figc, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-        monthly = d.set_index('ds')['y'].resample('ME').mean()
-        ax1.plot(monthly.index, monthly.values, color='#D55E00')
-        ax1.set_title('Monthly average close (historical)')
-        ax1.grid(True, alpha=0.3)
-        resid = y - poly(x)
-        ax2.hist(resid, bins=30, color='#009E73', alpha=0.8)
-        ax2.set_title('Residuals vs linear trend (historical)')
-        ax2.grid(True, alpha=0.3)
-        figc.tight_layout()
-        st.pyplot(figc)
-
-
     verified = "True"
     result = APP_BRAND_FULL
 
@@ -843,7 +876,7 @@ def main():
     if page == "Dashboard":
         render_dashboard_hero(st)
 
-        snp500 = pd.read_csv("./Datasets/SP500.csv")
+        snp500 = pd.read_csv(_sp500_csv)
         symbols = snp500['Symbol'].sort_values().tolist()
 
         top1, top2 = st.columns([2.2, 1])
@@ -1038,229 +1071,221 @@ def main():
             st.dataframe(price_df.tail(50), use_container_width=True)
         render_section_card_end(st)
 
+    elif page == "AI Analyst":
+        from views.ai_analyst import render_ai_analyst_page
+        render_ai_analyst_page(st, page_title, render_section_card_start, render_section_card_end)
+
     elif page == "Google Trends with Forecast":
-        page_title(st, "Search trends", "Finviz news activity index (by ticker) with forecast")
-        st.sidebar.write("""
-        ## Enter a company name or stock ticker
-        """)
+        from services.google_trends import fetch_google_news_articles, keyword_to_trends_query
+
+        page_title(st, "Search trends", "Google Trends news interest with forecast")
+        render_page_hero(
+            st,
+            icon="🔎",
+            kicker="Search & attention",
+            title="Google Trends news interest with forecast",
+            subtitle=(
+                "Scrapes Google Trends **news** search interest for your stock or company, "
+                "then projects the trend forward. Related headlines are pulled from Google News."
+            ),
+            pills=["Google Trends · news", "Stock / company query", "Prophet forecast", "Cached 30 min"],
+        )
+        st.sidebar.write("## Enter a company name or stock ticker")
         keyword = st.sidebar.text_input("Keyword or ticker", "Amazon")
         periods = st.sidebar.slider('Prediction time in days:', 7, 365, 90)
         st.sidebar.caption(
-            "Data comes from **Finviz** headline dates on the quote page (not Google Trends). "
-            "Results are cached ~30 minutes per keyword. Use a liquid ticker (e.g. AMZN, AAPL) for best coverage."
+            "Uses **Google Trends** with the news filter (`gprop=news`) — how often people "
+            "search news about this stock. Cached ~30 minutes per keyword."
         )
 
-        # main section
-        st.write("""
-        # Finviz activity trend
-        ### Daily news headline density on Finviz for the resolved symbol, scaled like an interest index
-        """)
-        st.image('https://media.tenor.com/xfmMlSJRvdoAAAAC/google-voice-search.gif',width=350, use_container_width=True)
-        st.write("Symbol (from keyword):", keyword, "→", _finviz_keyword_to_ticker(keyword))
+        trends_query = keyword_to_trends_query(keyword)
+        st.info(f"Google Trends news query: **{trends_query}** (from “{keyword}”)")
 
         try:
-            df = get_data(keyword)
-        except Exception:
+            df = get_search_trends_data(keyword)
+        except Exception as exc:
             st.error(
-                "Could not build a Finviz activity series. Use a valid US ticker (e.g. MSFT) or a "
-                "supported company keyword (e.g. Amazon → AMZN), then try again."
+                "Could not load search trend data from Google Trends or Finviz. "
+                "Try a company name (e.g. Amazon, Tesla) or ticker (e.g. AMZN, TSLA)."
             )
+            with st.expander("Technical details"):
+                st.code(str(exc))
             st.stop()
 
-        if st.session_state.get(f"_finviz_trends_used_fallback_{str(keyword or '').strip() or 'Amazon'}"):
+        kw_norm = str(keyword or "").strip() or "Amazon"
+        data_source = st.session_state.get(f"_google_trends_source_{kw_norm}", "Google Trends")
+        if data_source and "Finviz" in str(data_source):
+            st.warning(
+                f"Showing **{data_source}** — Google Trends was unavailable "
+                "(rate limit or library issue). Charts use Finviz headline volume instead."
+            )
+            reason = st.session_state.get(f"_google_trends_fallback_reason_{kw_norm}")
+            if reason:
+                with st.expander("Why Google Trends failed"):
+                    st.caption(reason)
+        elif st.session_state.get(f"_google_trends_used_fallback_{kw_norm}"):
             st.info(
-                "Could not refresh from Finviz; showing the **last successful** activity series "
+                "Could not refresh from Google Trends; showing the **last successful** series "
                 "for this keyword in your current session."
             )
+        else:
+            st.caption(f"Data source: **{data_source}**")
 
         forecast, fig1, fig2 = make_pred(df, periods, show_fallback_caption=True)
 
         st.pyplot(fig1)
-            
-        
-        st.write("Activity over the calendar (monthly / weekday patterns)")
+
+        st.write("News interest over the calendar (monthly / weekday patterns)")
         st.pyplot(fig2)
 
+        render_section_card_start(st, "Related news articles", "Headlines from Google News for this stock")
+        try:
+            articles = fetch_google_news_articles(keyword, limit=12)
+            if articles:
+                for art in articles:
+                    headline = art.get("headline", "")
+                    url = art.get("url", "")
+                    pub = art.get("published", "")
+                    if url:
+                        st.markdown(f"- [{headline}]({url})  \n  <span style='opacity:0.7;font-size:0.85em'>{pub}</span>", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"- {headline}")
+            else:
+                st.info("No related news articles found for this query.")
+        except Exception:
+            st.warning("Could not load related news articles right now.")
+        render_section_card_end(st)
+
     elif page == "About the Project":
-        page_title(st, "Overview", "Data sources, architecture, and embedded dashboard")
+        page_title(st, "Overview", "Data sources, architecture, and open-source analytics dashboard")
         col_main, col_rail = st.columns([2.2, 1])
         with col_main:
-            st.title('Data Sources')
+            st.title("Data Sources")
             st.write("""
-            ### Our F.A.S.T application have 3 data sources for two different use cases:
-            #### 1. Web Scrapping to get Live News Data
-            #### 2. Twitter API to get Real time Tweets
-            #### 3. Finviz (quote + news) for trend-style activity charts
+            ### F.A.S.T uses live and local data sources:
+            - **Yahoo Finance** — prices, fundamentals, benchmarks
+            - **Finviz** — news headlines and snapshot fundamentals
+            - **Google Trends** — news search interest and related headlines (Search trends)
+            - **X (Twitter) + Kafka** — real-time tweet stream for social trend analysis
+            - **Earnings transcripts** — local corpus for RAG / AI Analyst
+            - **VADER + Prophet** — sentiment scoring and forecasting
             """)
-            st.text('')
 
+            st.title("AWS Data Architecture")
+            if _arch_image:
+                st.image(str(_arch_image), width=900, use_container_width=True)
 
-            st.title('AWS Data Architecture')
-            st.image('./Images/Architecture Final AWS_FAST.jpg', width=900, use_container_width=True)
-
-            st.title('Dashboard')
-            import streamlit.components.v1 as components
-            components.iframe("https://app.powerbi.com/reportEmbed?reportId=ae040e1c-7da3-4b0b-bd58-844abe577eea&autoAuth=true&ctid=a8eec281-aaa3-4dae-ac9b-9a398b9215e7", height=400, width=800)
+            st.title("Market Dashboard")
+            st.caption("Open-source dashboard built with Plotly and Streamlit — no Power BI or external login.")
+            from views.overview_dashboard import render_overview_dashboard
+            render_overview_dashboard(st)
         with col_rail:
             render_right_rail_placeholder(st)
 
     
     elif page == "Meeting Summarization":
-        page_title(st, "Meeting notes", "Audio preview and text summary helpers")
+        page_title(st, "Meeting notes", "Earnings transcript summarization with RAG")
 
-        symbols = ['./Audio Files/Meeting 1.mp3','./Audio Files/Meeting 2.mp3', './Audio Files/Meeting 3.mp3', './Audio Files/Meeting 4.mp3']
+        data_dir = _transcripts_dir
+        available_tickers = sorted([
+            f for f in listdir(data_dir)
+            if isfile(join(data_dir, f)) and not f.startswith('.')
+        ])
 
-        track = st.selectbox('Choose a the Meeting Audio',symbols)
-
-        st.audio(track)
-        data_dir = './inference-data/'
-
-        ratiodata = st.text_input("Please Enter a Ratio you want summary by: (TRY: 0.01)")
-        if st.button("Generate a Summarized Version of the Meeting"):
-            time.sleep(2.4)
-            #st.success("This is the Summarized text of the Meeting Audio Files xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  xxxxxxgeeeeeeeeeeeeeee eeeeeeeeeeeeeehjjjjjjjjjjjjjjjsdbjhvsdk vjbsdkvjbsdvkb skbdv")
-            
-            
-            if track == "./Audio Files/Meeting 2.mp3":
-                user_input = "NKE"
-                time.sleep(1.4)
-                try:
-                    with open(data_dir + user_input) as f:
-                        st.success(safe_summarize(f.read(), ratio=float(ratiodata)))          
-                        #print()
-                        st.warning("Sentiment: Negative")
-                except:
-                    st.text("Please Enter a valid Decimal value like 0.01")
-
-            else:
-                user_input = "AGEN"
-                time.sleep(1.4)
-                try:
-                    with open(data_dir + user_input) as f:
-                        st.success(safe_summarize(f.read(), ratio=float(ratiodata)))          
-                        #print()
-                        st.success("Sentiment: Positive")
-                except:
-                    st.text("Please Enter a valid Decimal value like 0.01")
-
-    elif page == "Twitter Trends":
-        page_title(st, "Social trends", "Finviz news activity index (same Finviz feed as Search trends)")
-        st.write("""
-        # Social / attention proxy (Finviz)
-        ### Uses **Finviz** headline timestamps for a ticker — not the X (Twitter) API
-        """)
-        st.image('https://assets.teenvogue.com/photos/56b4f21327a088e24b967bb6/3:2/w_531,h_354,c_limit/twitter-gifs.gif',width=350, use_container_width=True)
-        
-        st.sidebar.write("""
-        ## Company name or ticker, and forecast horizon
-        """)
-        keyword = st.sidebar.text_input("Keyword or ticker", "Amazon")
-        periods = st.sidebar.slider('Prediction time in days:', 7, 365, 90)
-        st.sidebar.caption(
-            "Uses **Finviz** quote-page news (not Google Trends or X). Cached ~30 minutes per keyword."
+        ticker_pick = st.selectbox(
+            "Select earnings transcript",
+            available_tickers,
+            index=available_tickers.index("NKE") if "NKE" in available_tickers else 0,
         )
 
-        st.subheader(f"Finviz news activity: **{_finviz_keyword_to_ticker(keyword)}** (from “{keyword}”)")
+        use_rag = st.checkbox("Use RAG + AI summary (recommended)", value=True)
 
-        try:
-            df = get_data(keyword)
-        except Exception:
-            st.error(
-                "Could not build a Finviz activity series. Enter a valid US ticker or a supported company name."
-            )
-            st.stop()
+        if st.button("Generate Summary"):
+            with st.spinner("Summarizing..."):
+                if use_rag:
+                    try:
+                        from rag.retriever import get_retriever
+                        from agents.orchestrator import get_agent
 
-        if st.session_state.get(f"_finviz_trends_used_fallback_{str(keyword or '').strip() or 'Amazon'}"):
-            st.info(
-                "Could not refresh from Finviz; showing the **last successful** activity series "
-                "for this keyword in your current session."
-            )
+                        retriever = get_retriever()
+                        ctx = retriever.query_with_context(
+                            f"key highlights risks outlook financial results for {ticker_pick}",
+                            ticker_pick,
+                        )
+                        if ctx.get("context"):
+                            agent = get_agent()
+                            result = agent.chat(
+                                f"Summarize this earnings call transcript for {ticker_pick}. "
+                                f"Include sentiment (positive/negative/mixed) and key financial metrics.\n\n"
+                                f"{ctx['context'][:6000]}",
+                                ticker=ticker_pick,
+                            )
+                            st.success(result.get("response", "No summary generated."))
+                            if ctx.get("sources"):
+                                st.caption(f"Sources: {len(ctx['sources'])} transcript chunks via RAG")
+                        else:
+                            st.warning("No RAG results. Index corpus on AI Analyst → Setup, or use fallback.")
+                            use_rag = False
+                    except Exception as exc:
+                        st.warning(f"RAG unavailable ({exc}). Falling back to extractive summary.")
+                        use_rag = False
 
-        forecast, fig1, fig2 = make_pred(df, periods, show_fallback_caption=False)
+                if not use_rag:
+                    ratiodata = st.session_state.get("_meeting_ratio", "0.05")
+                    try:
+                        with open(data_dir + ticker_pick) as f:
+                            st.success(safe_summarize(f.read(), ratio=float(ratiodata)))
+                    except Exception:
+                        st.error("Could not read transcript file.")
 
-        st.pyplot(fig1)
-        st.write("Activity over the calendar (monthly / weekday patterns)")
-        st.pyplot(fig2)
+        ratiodata = st.text_input(
+            "Extractive ratio (fallback mode only)",
+            value="0.05",
+            key="_meeting_ratio",
+        )
 
-
-
-        
+    elif page == "Twitter Trends":
+        from views.x_social_trends import render_x_social_trends_page
+        render_x_social_trends_page(
+            st,
+            page_title=page_title,
+            render_page_hero=render_page_hero,
+            render_section_card_start=render_section_card_start,
+            render_section_card_end=render_section_card_end,
+            render_sentiment_badge=render_sentiment_badge,
+            make_pred=make_pred,
+        )
     elif page == "Stock Future Prediction":
-        page_title(st, "Stock forecast", "Historical prices and forward projection")
-        snp500 = pd.read_csv("./Datasets/SP500.csv")
-        symbols = snp500['Symbol'].sort_values().tolist()   
-
-        ticker = st.sidebar.selectbox(
-            'Choose a S&P 500 Stock',
-            symbols)
-
-        START = "2015-01-01"
-        TODAY = date.today().strftime("%Y-%m-%d")
-
-        st.image('https://media2.giphy.com/media/JtBZm3Getg3dqxK0zP/giphy-downsized-large.gif', width=250, use_container_width=True)
-
-        n_years = st.slider('Years of prediction:', 1, 4)
-        period = n_years * 365
-
-        data_load_state = st.text('Loading data...')
-
-        data = safe_yf_download(ticker, START, TODAY)
-        if data.empty:
-            st.stop()
-        data.reset_index(inplace=True)
-        data_load_state.text('Loading data... done!')
-
-        st.subheader('Raw data')
-        st.write(data.tail())
-
-        # Plot raw data
-        def plot_raw_data():
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=data['Date'], y=data['Open'], name="stock_open"))
-            fig.add_trace(go.Scatter(x=data['Date'], y=data['Close'], name="stock_close"))
-            fig.layout.update(title_text='Time Series data with Rangeslider', xaxis_rangeslider_visible=True)
-            st.plotly_chart(fig)
-            
-        plot_raw_data()
-
-        df_train = data[['Date', 'Close']].copy()
-        df_train = df_train.rename(columns={'Date': 'ds', 'Close': 'y'})
-        df_train['ds'] = pd.to_datetime(df_train['ds'], errors='coerce')
-        df_train['y'] = pd.to_numeric(df_train['y'], errors='coerce').ffill().bfill()
-
-        if prophet_available and plot_plotly is not None:
-            try:
-                m = Prophet()
-                m.fit(df_train)
-                future = m.make_future_dataframe(periods=period)
-                forecast = m.predict(future)
-                st.subheader('Forecast data')
-                st.write(forecast.tail())
-                st.write(f'Forecast plot for {n_years} years')
-                fig1 = plot_plotly(m, forecast)
-                st.plotly_chart(fig1)
-                st.write('Forecast components')
-                fig2 = m.plot_components(forecast)
-                st.pyplot(fig2)
-            except Exception:
-                st.caption('Prophet failed; using linear trend forecast instead.')
-                _stock_forecast_fallback(df_train, period, n_years)
-        else:
-            st.caption('Using linear trend forecast (Prophet is not installed or not usable on this machine).')
-            _stock_forecast_fallback(df_train, period, n_years)
+        from views.forecast_ui import render_stock_forecast_page
+        render_stock_forecast_page(
+            st,
+            page_title=page_title,
+            render_page_hero=render_page_hero,
+            render_section_card_start=render_section_card_start,
+            render_section_card_end=render_section_card_end,
+            apply_plotly_theme=apply_plotly_dark,
+            sp500_csv_path=_sp500_csv,
+            safe_yf_download=safe_yf_download,
+            prophet_available=prophet_available,
+            Prophet=Prophet,
+            plot_plotly=plot_plotly,
+        )
 
 
 
 
     
     elif page == "Company Advanced Details":
-        page_title(st, "Technicals", "Moving averages and MACD")
-        snp500 = pd.read_csv("./Datasets/SP500.csv")
+        page_title(st, "Technicals", "SMA, EMA, MACD, RSI, and Bollinger Bands")
+
+        snp500 = pd.read_csv(_sp500_csv)
         symbols = snp500['Symbol'].sort_values().tolist()   
 
         ticker = st.sidebar.selectbox(
             'Choose a S&P 500 Stock',
-            symbols)
+            symbols,
+            key="technicals_ticker",
+        )
 
         def calcMovingAverage(data, size):
             df = data.copy()
@@ -1414,8 +1439,112 @@ def main():
             x=0
         ))
 
-        figMACD.update_yaxes(tickprefix="$")
+        figMACD.update_yaxes(tickprefix="$", row=1, col=1)
+        figMACD = apply_plotly_dark(figMACD, height=520)
         st.plotly_chart(figMACD, use_container_width=True)
+
+        # ── Bollinger Bands ──
+        render_section_card_start(st, "Bollinger Bands", "Volatility envelope around a moving average")
+        col_bb1, col_bb2, col_bb3 = st.columns(3)
+        with col_bb1:
+            numYearBB = st.number_input("Period (years)", min_value=1, max_value=10, value=2, key="bb_years")
+        with col_bb2:
+            bb_window = st.number_input("Band window (days)", min_value=10, max_value=60, value=20, key="bb_window")
+        with col_bb3:
+            bb_std = st.number_input("Std deviations", min_value=1.0, max_value=3.0, value=2.0, step=0.5, key="bb_std")
+
+        start_bb = dt.datetime.today() - dt.timedelta(numYearBB * 365)
+        data_bb = safe_yf_download(ticker, start_bb, dt.datetime.today())
+        if not data_bb.empty:
+            data_bb = data_bb.reset_index()
+            price_col_bb = get_price_column(data_bb)
+            if price_col_bb:
+                work_bb = data_bb[["Date", price_col_bb]].copy() if "Date" in data_bb.columns else data_bb[[price_col_bb]].copy()
+                work_bb[price_col_bb] = pd.to_numeric(work_bb[price_col_bb], errors="coerce")
+                work_bb = work_bb.dropna()
+                if not work_bb.empty:
+                    close_bb = work_bb[price_col_bb]
+                    bb = compute_bollinger_bands(close_bb, window=int(bb_window), num_std=float(bb_std))
+                    dates_bb = work_bb["Date"] if "Date" in work_bb.columns else work_bb.index
+
+                    fig_bb = go.Figure()
+                    fig_bb.add_trace(go.Scatter(
+                        x=dates_bb, y=bb["upper"], name="Upper band",
+                        line=dict(color="#2563EB", width=1, dash="dot"),
+                    ))
+                    fig_bb.add_trace(go.Scatter(
+                        x=dates_bb, y=bb["lower"], name="Lower band",
+                        line=dict(color="#2563EB", width=1, dash="dot"),
+                        fill="tonexty", fillcolor="rgba(99, 102, 241, 0.10)",
+                    ))
+                    fig_bb.add_trace(go.Scatter(
+                        x=dates_bb, y=bb["middle"], name=f"SMA {int(bb_window)}",
+                        line=dict(color="#F59E0B", width=1.5),
+                    ))
+                    fig_bb.add_trace(go.Scatter(
+                        x=dates_bb, y=close_bb, name="Close",
+                        line=dict(color="#0F172A" if st.session_state.get("ui_theme_is_light", True) else "#E8EEF5", width=2),
+                    ))
+                    fig_bb.update_layout(title=f"{ticker} — Bollinger Bands ({int(bb_window)}, {bb_std}σ)")
+                    fig_bb.update_yaxes(tickprefix="$")
+                    fig_bb = apply_plotly_dark(fig_bb, height=420)
+                    st.plotly_chart(fig_bb, use_container_width=True)
+
+                    tech = get_technicals_summary(data_bb, price_col_bb)
+                    b1, b2, b3, b4 = st.columns(4)
+                    b1.metric("Upper band", f"${tech.get('bb_upper', '—')}")
+                    b2.metric("Middle (SMA)", f"${tech.get('bb_middle', '—')}")
+                    b3.metric("Lower band", f"${tech.get('bb_lower', '—')}")
+                    b4.metric("%B position", f"{tech.get('bb_percent_b', '—')}%")
+        render_section_card_end(st)
+
+        # ── RSI ──
+        render_section_card_start(st, "Relative Strength Index (RSI)", "Momentum oscillator — 70 overbought, 30 oversold")
+        col_rsi1, col_rsi2 = st.columns(2)
+        with col_rsi1:
+            numYearRSI = st.number_input("Period (years)", min_value=1, max_value=10, value=2, key="rsi_years")
+        with col_rsi2:
+            rsi_period = st.number_input("RSI period (days)", min_value=7, max_value=21, value=14, key="rsi_period")
+
+        start_rsi = dt.datetime.today() - dt.timedelta(numYearRSI * 365)
+        data_rsi = safe_yf_download(ticker, start_rsi, dt.datetime.today())
+        if not data_rsi.empty:
+            data_rsi = data_rsi.reset_index()
+            price_col_rsi = get_price_column(data_rsi)
+            if price_col_rsi:
+                work_rsi = data_rsi[["Date", price_col_rsi]].copy() if "Date" in data_rsi.columns else data_rsi[[price_col_rsi]].copy()
+                work_rsi[price_col_rsi] = pd.to_numeric(work_rsi[price_col_rsi], errors="coerce")
+                work_rsi = work_rsi.dropna()
+                if not work_rsi.empty:
+                    close_rsi = work_rsi[price_col_rsi]
+                    rsi = compute_rsi(close_rsi, period=int(rsi_period))
+                    dates_rsi = work_rsi["Date"] if "Date" in work_rsi.columns else work_rsi.index
+
+                    fig_rsi = go.Figure()
+                    fig_rsi.add_trace(go.Scatter(
+                        x=dates_rsi, y=rsi, name=f"RSI ({int(rsi_period)})",
+                        line=dict(color="#8B5CF6", width=2),
+                        fill="tozeroy", fillcolor="rgba(139, 92, 246, 0.08)",
+                    ))
+                    fig_rsi.add_hline(y=70, line_dash="dash", line_color="#EF4444",
+                                      annotation_text="Overbought (70)", annotation_position="right")
+                    fig_rsi.add_hline(y=30, line_dash="dash", line_color="#22C55E",
+                                      annotation_text="Oversold (30)", annotation_position="right")
+                    fig_rsi.add_hline(y=50, line_dash="dot", line_color="rgba(128,128,128,0.5)")
+                    fig_rsi.update_layout(
+                        title=f"{ticker} — RSI ({int(rsi_period)})",
+                        yaxis=dict(range=[0, 100], title="RSI"),
+                    )
+                    fig_rsi = apply_plotly_dark(fig_rsi, height=360)
+                    st.plotly_chart(fig_rsi, use_container_width=True)
+
+                    rsi_now = float(rsi.iloc[-1]) if len(rsi) else None
+                    rsi_label = "Overbought" if rsi_now and rsi_now >= 70 else "Oversold" if rsi_now and rsi_now <= 30 else "Neutral"
+                    r1, r2, r3 = st.columns(3)
+                    r1.metric("Current RSI", f"{rsi_now:.1f}" if rsi_now else "—")
+                    r2.metric("RSI signal", rsi_label)
+                    r3.metric("Period", f"{int(rsi_period)} days")
+        render_section_card_end(st)
 
 
         
@@ -1427,81 +1556,38 @@ def main():
 
     elif page == "Live News Sentiment":
         page_title(st, "News & sentiment", "Headlines and VADER scores from Finviz")
-        st.image('https://www.visitashland.com/files/latestnews.jpg', width=250, use_container_width=True)
+        render_page_hero(
+            st,
+            icon="📰",
+            kicker="News & sentiment",
+            title="Live headlines with AI sentiment scores",
+            subtitle=(
+                "Pulls the latest Finviz headlines for any S&P 500 ticker and scores each headline "
+                "with VADER — positive, neutral, or negative — with charts and a full table."
+            ),
+            pills=["Finviz news", "VADER NLP", "Donut chart", "Timeline", "Styled table"],
+        )
 
-        snp500 = pd.read_csv("./Datasets/SP500.csv")
-        symbols = snp500['Symbol'].sort_values().tolist()   
+        snp500 = pd.read_csv(_sp500_csv)
+        symbols = snp500["Symbol"].sort_values().tolist()
 
-        ticker = st.sidebar.selectbox(
-            'Choose a S&P 500 Stock',
-            symbols)
+        ticker = st.sidebar.selectbox("Choose a S&P 500 stock", symbols, key="news_sentiment_ticker")
 
-        if st.button("Click here to See Latest News about " + ticker):
-            st.header('Latest News') 
-
-            def newsfromfizviz(temp):
-                finwiz_url = 'https://finviz.com/quote.ashx?t='
-                news_tables = {}
-                tickers = [temp]
-
-                for ticker in tickers:
-                    url = finwiz_url + ticker
-                    req = Request(url=url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'})
-                    response = urlopen(req)
-                    html = BeautifulSoup(response, 'html.parser')
-                    news_table = html.find(id='news-table')
-                    news_tables[ticker] = news_table
-
-                parsed_news = []
-                for file_name, news_table in news_tables.items():
-                    for x in news_table.findAll('tr'):
-                        if x.a:
-                            text = x.a.get_text()
-                        else:
-                            text = "No headline available"
-                        date_scrape = x.td.text.split()
-                        if len(date_scrape) == 1:
-                            time = date_scrape[0]
-                        else:
-                            date = date_scrape[0]
-                            time = date_scrape[1]
-                        ticker = file_name.split('_')[0]
-                        parsed_news.append([ticker, date, time, text])
-
-                vader = SentimentIntensityAnalyzer()
-                columns = ['ticker', 'date', 'time', 'headline']
-                parsed_and_scored_news = pd.DataFrame(parsed_news, columns=columns)
-                scores = parsed_and_scored_news['headline'].apply(vader.polarity_scores).tolist()
-                scores_df = pd.DataFrame(scores)
-                parsed_and_scored_news = parsed_and_scored_news.join(scores_df, rsuffix='_right')
-                parsed_and_scored_news['date'] = pd.to_datetime(parsed_and_scored_news['date'], errors='coerce').dt.date
-                parsed_and_scored_news['Sentiment'] = np.where(parsed_and_scored_news['compound'] > 0, 'Positive', np.where(parsed_and_scored_news['compound'] == 0, 'Neutral', 'Negative'))
-                return parsed_and_scored_news
-
-            df = newsfromfizviz(ticker)
-            df_pie = df[['Sentiment', 'headline']].groupby('Sentiment').count()
-            fig = px.pie(df_pie, values=df_pie['headline'], names=df_pie.index, color=df_pie.index, color_discrete_map={'Positive': 'green', 'Neutral': 'darkblue', 'Negative': 'red'})
-
-            st.subheader('Dataframe with Latest News')
-            st.dataframe(df)
-
-            st.subheader('Latest News Sentiment Distribution using Pie Chart')
-            st.plotly_chart(fig)
-
-            plt.rcParams['figure.figsize'] = [11, 5]
-            mean_scores = df.groupby(['ticker', 'date']).mean(numeric_only=True)
-            mean_scores = mean_scores.unstack()
-            mean_scores = mean_scores.xs('compound', axis="columns").transpose()
-            mean_scores.plot(kind='bar')
-            plt.grid()
-            st.subheader('Sentiments over Time')
-            st.pyplot(plt)
+        load = st.button(f"Load news for {ticker}", type="primary", key="load_news_sentiment")
+        if load or st.session_state.get("_news_loaded_ticker") == ticker:
+            st.session_state["_news_loaded_ticker"] = ticker
+            from views.news_sentiment_ui import render_news_sentiment_content
+            render_news_sentiment_content(
+                st, ticker, render_section_card_start, render_section_card_end
+            )
+        else:
+            st.info("Select a ticker and click **Load news** to fetch the latest headlines and charts.")
 
 
 
 
     elif page == "Company Basic Details":
-        snp500 = pd.read_csv("./Datasets/SP500.csv")
+        snp500 = pd.read_csv(_sp500_csv)
         symbols = snp500['Symbol'].sort_values().tolist()   
 
         ticker = st.sidebar.selectbox(

@@ -11,3 +11,18 @@ seaborn
 openpyxl
 tqdm
 vaderSentiment
+beautifulsoup4
+prophet
+pytrends>=4.9.2
+urllib3>=1.26.18,<2
+kafka-python
+
+# Agentic AI, RAG, API, MCP
+fastapi
+uvicorn[standard]
+pydantic-settings
+openai
+chromadb
+mcp
+requests
+# sentence-transformers removed — RAG uses Chroma's bundled ONNX MiniLM (lighter, no torchvision)

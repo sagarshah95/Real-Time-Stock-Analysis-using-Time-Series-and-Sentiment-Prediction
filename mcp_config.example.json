@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "fast-stock-analysis": {
+      "command": "python",
+      "args": ["-m", "mcp_server.server"],
+      "cwd": "REPLACE_WITH_PROJECT_ROOT",
+      "env": {
+        "PYTHONPATH": "REPLACE_WITH_PROJECT_ROOT"
+      }
+    }
+  }
+}
