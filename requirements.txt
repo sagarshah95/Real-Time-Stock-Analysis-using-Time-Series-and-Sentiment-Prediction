@@ -22,7 +22,8 @@ fastapi
 uvicorn[standard]
 pydantic-settings
 openai
-chromadb
+chromadb>=0.5.0
+protobuf==3.20.3
 mcp
 requests
 # sentence-transformers removed — RAG uses Chroma's bundled ONNX MiniLM (lighter, no torchvision)

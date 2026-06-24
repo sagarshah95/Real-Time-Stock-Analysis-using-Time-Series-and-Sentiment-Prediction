@@ -159,8 +159,17 @@ def inject_global_css(st):
             color: {c["text_strong"]} !important;
         }}
 
-        p, label, .stMarkdown, .stCaption {{
-            color: {c["muted"]};
+        p, label, .stMarkdown {{
+            color: {c["text"]};
+        }}
+
+        .stCaption,
+        [data-testid="stCaptionContainer"],
+        [data-testid="stCaptionContainer"] p,
+        [data-testid="stCaptionContainer"] span {{
+            color: {c["text"]} !important;
+            opacity: 0.92;
+            font-size: 0.875rem !important;
         }}
 
         section[data-testid="stSidebar"] > div {{

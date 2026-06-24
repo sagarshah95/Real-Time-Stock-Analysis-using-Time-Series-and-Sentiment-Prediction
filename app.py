@@ -5,6 +5,10 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+from config.bootstrap import apply_runtime_compat
+
+apply_runtime_compat()
 # data_dir2 = '/root/Assignment4/Assignment-Trial/Assignment-Trial/fastAPIandStreamlit/awsdownload/'
 
 

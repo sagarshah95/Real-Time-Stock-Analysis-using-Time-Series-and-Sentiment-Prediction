@@ -6,6 +6,10 @@ import logging
 from functools import lru_cache
 from typing import Any
 
+from config.bootstrap import apply_runtime_compat
+
+apply_runtime_compat()
+
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 

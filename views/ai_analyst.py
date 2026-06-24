@@ -76,7 +76,11 @@ def render_ai_analyst_page(st_module, page_title_fn, render_section_card_start, 
                 st.metric("RAG docs", rag_health().get("document_count", 0))
             except Exception as exc:
                 st.metric("RAG docs", "—")
-                st.caption(f"RAG: {exc}")
+                with st.expander("RAG setup issue", expanded=False):
+                    st.error(str(exc))
+                    st.caption(
+                        "If this mentions protobuf, restart the app after `pip install -r requirements.txt`."
+                    )
 
     tab_chat, tab_analyze, tab_rag, tab_setup = st.tabs(
         ["Chat", "Full Analysis", "RAG Search", "Setup"]

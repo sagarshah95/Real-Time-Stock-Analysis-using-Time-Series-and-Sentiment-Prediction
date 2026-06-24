@@ -7,7 +7,17 @@ Run with:
 from __future__ import annotations
 
 import logging
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from config.bootstrap import apply_runtime_compat
+
+apply_runtime_compat()
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware

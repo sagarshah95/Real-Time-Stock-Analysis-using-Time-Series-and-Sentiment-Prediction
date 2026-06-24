@@ -64,6 +64,10 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"),
     )
+    protocol_buffers_python_implementation: str = Field(
+        default="",
+        alias="PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION",
+    )
 
     # Paths (see data/ and config/paths.py)
     inference_data_dir: str = Field(
@@ -218,8 +222,11 @@ def apply_hf_hub_token(token: str = "", *, force: bool = False) -> None:
 
 @lru_cache
 def get_settings() -> Settings:
+    from config.bootstrap import apply_settings_env
+
     settings = Settings()
     apply_hf_hub_token(settings.hf_token)
+    apply_settings_env(settings)
     return settings
 
 
